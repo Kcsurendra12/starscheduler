@@ -28,7 +28,7 @@ StarScheduler is a comprehensive control and scheduling application designed for
 
 1.  Clone the repository:
     ```bash
-    git clone https://github.com/yourusername/starscheduler.git
+    git clone https://github.com/SSPWXR0/starscheduler.git
     cd starscheduler
     ```
 
