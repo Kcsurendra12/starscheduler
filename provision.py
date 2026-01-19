@@ -8,14 +8,52 @@ import logging
 import time
 import socket
 import telnetlib3
+import subprocess
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger("starscheduler.provision")
 
-i2exec = 'C:\\Program Files (x86)\\TWC\\I2\\exec.exe'
+i2exec = "C:\\Program Files (x86)\\TWC\\I2\\exec.exe"
 
-_executor = ThreadPoolExecutor(max_workers=10)
+def _get_optimal_thread_count(max_threads: int = 16) -> int:
+    """Calculate optimal thread count based on CPU cores and config limit.
+    Uses conservative allocation: min(cpu_cores, max_threads, 8) for I/O-bound work.
+    """
+    try:
+        cpu_count = os.cpu_count() or 2
+        # For I/O-bound subprocess work, use fewer threads than cores
+        # to avoid context-switching overhead
+        optimal = min(cpu_count, max_threads, 8)
+        return max(2, optimal)  # Minimum 2 threads
+    except Exception:
+        return 4  # Safe fallback
+
+# Lazy-initialized executor - created on first use with dynamic worker count
+_executor: Optional[ThreadPoolExecutor] = None
+_executor_max_workers: int = 16
+
+def _get_executor() -> ThreadPoolExecutor:
+    """Get or create the shared thread pool executor (lazy initialization)."""
+    global _executor
+    if _executor is None:
+        worker_count = _get_optimal_thread_count(_executor_max_workers)
+        _executor = ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="provision_worker"
+        )
+        logger.info(f"Initialized provision executor with {worker_count} workers")
+    return _executor
+
+def configure_executor(max_threads: int = 16) -> None:
+    """Configure the executor max threads before first use."""
+    global _executor_max_workers, _executor
+    _executor_max_workers = max_threads
+    if _executor is not None:
+        # Shutdown old executor and recreate
+        _executor.shutdown(wait=False)
+        _executor = None
+        _get_executor()  # Recreate with new settings
 
 dangerous_commands = re.compile(
     r'(cleardata|syncstarbundleversions|rm\s+-rf\s+(?:--no-preserve-root\s+)?/|:\(\)\s*\{\s*:\|\s*:\&\s*\}\s*;:)',
@@ -23,30 +61,54 @@ dangerous_commands = re.compile(
 )
 
 async def execute_local_command(command: str, timeout: float = 10.0) -> tuple[str, str]:
-    kwargs = {
-        'stdout': asyncio.subprocess.PIPE,
-        'stderr': asyncio.subprocess.PIPE,
-        'shell': True,
-    }
-    if os.name == 'nt':
-        kwargs['creationflags'] = 0x08000000
+
+    loop = asyncio.get_event_loop()
+
+    def _run_subprocess_sync():
+        """Synchronous subprocess execution - runs in thread pool."""
+        try:
+            kwargs = {
+                'shell': True,
+                'stdout': subprocess.PIPE,
+                'stderr': subprocess.PIPE,
+                'timeout': timeout,
+                'text': False,
+            }
+            
+            if sys.platform == 'win32':
+                # CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS | IDLE_PRIORITY_CLASS
+                kwargs['creationflags'] = 0x08000000 | 0x00004000
+            if dangerous_commands.search(command):
+                logger.error(f"Attention! Dangerous command detected in local execution: {command}. Exiting...")
+                sys.exit(1)
+            result = subprocess.run(command, **kwargs)
+            stdout_str = result.stdout.decode('utf-8', errors='replace') if result.stdout else ""
+            stderr_str = result.stderr.decode('utf-8', errors='replace') if result.stderr else ""
+            
+            return stdout_str, stderr_str
+
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"Local subprocess command timed out after {timeout}s: {command}")
+            stdout_partial = e.stdout.decode('utf-8', errors='replace') if e.stdout else ""
+            stderr_partial = e.stderr.decode('utf-8', errors='replace') if e.stderr else ""
+            return stdout_partial, f"Timeout after {timeout}s. {stderr_partial}".strip()
+        except FileNotFoundError as e:
+            logger.error(f"Command not found: {e}")
+            return "", f"Command not found: {e}"
+        except PermissionError as e:
+            logger.error(f"Permission denied: {e}")
+            return "", f"Permission denied: {e}"
+        except Exception as e:
+            logger.error(f"Failed to execute local command: {e}")
+            return "", str(e)
+
+    stdout_str, stderr_str = await loop.run_in_executor(_get_executor(), _run_subprocess_sync)
     
-    proc = await asyncio.create_subprocess_shell(command, **kwargs)
-    
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        logger.error(f"Local subprocess command timed out after {timeout}s: {command}")
-        return "", f"Command timed out after {timeout} seconds"
-    
-    stdout_str = stdout.decode('utf-8', errors='replace')
-    stderr_str = stderr.decode('utf-8', errors='replace')
     if stdout_str:
         logger.debug(f"Local Subprocess output: {stdout_str}")
     if stderr_str:
         logger.error(f"Error in local subprocess: {stderr_str}")
+    
     return stdout_str, stderr_str
 
 async def execute_udp_message(hostname: str, port: int, message: str, timeout: float = 5.0) -> None:
@@ -66,7 +128,7 @@ async def execute_udp_message(hostname: str, port: int, message: str, timeout: f
         finally:
             sock.close()
     
-    await loop.run_in_executor(_executor, _udp_send)
+    await loop.run_in_executor(_get_executor(), _udp_send)
 
 
 async def execute_ssh_command(hostname: str, user: str, password: str, port: int, command: str, su: Optional[str] = None, timeout: float = 5.0) -> tuple[str, str]:
@@ -87,19 +149,34 @@ async def execute_ssh_command(hostname: str, user: str, password: str, port: int
             
             if su:
                 shell = ssh_client.invoke_shell()
+                # Wait for initial shell prompt
+                time.sleep(0.3)
+                while shell.recv_ready():
+                    shell.recv(4096)
+                
+                # Send su command
                 shell.send(f"su -l {su}\n".encode())
-                await_time = time.time()
-                while time.time() - await_time < 2:
+                
+                # Wait for su to complete and shell to be ready
+                su_wait_start = time.time()
+                su_output = ""
+                while time.time() - su_wait_start < 3:
                     if shell.recv_ready():
-                        shell.recv(4096)
-                        break
+                        data = shell.recv(4096).decode('utf-8', errors='replace')
+                        su_output += data
+                        # Look for shell prompt indicators
+                        if '$' in data or '#' in data or '>' in data:
+                            break
                     time.sleep(0.1)
+                
+                logger.debug(f"SSH su output: {su_output}")
+                
                 cmd_encode = (command + "\n").encode("utf-8", errors="replace")
                 if dangerous_commands.search(command):
                     logger.error(f"Attention! Dangerous command detected in SSH execution on {hostname}: {command}. Exiting...")
                     sys.exit(1)
                 shell.send(cmd_encode)
-                logger.info(f"SSH (Shell): Executing on {hostname}: {command}")
+                logger.info(f"SSH (Shell): Executing on {hostname} as {su}: {command}")
                 time.sleep(0.5)
                 output = ""
                 start_time = time.time()
@@ -134,7 +211,7 @@ async def execute_ssh_command(hostname: str, user: str, password: str, port: int
         finally:
             ssh_client.close()
     
-    return await loop.run_in_executor(_executor, _ssh_exec)
+    return await loop.run_in_executor(_get_executor(), _ssh_exec)
 
 async def execute_telnet_command(hostname: str, port: int, command: str, user: Optional[str] = None, password: Optional[str] = None, su: Optional[str] = None, timeout: float = 5.0) -> tuple[str, str]:
     try:
@@ -196,7 +273,7 @@ async def execute_telnet_command(hostname: str, port: int, command: str, user: O
     return output, stderr
 
 async def subproc_load_i2_pres(flavor: str, PresentationId: str, duration: int, logo: str = "") -> None:
-    command = f'{i2exec} loadPres(Flavor="{flavor}",Duration="{duration}",PresentationId="{PresentationId}")'
+    command = f'"{i2exec}" loadPres(Flavor="{flavor}",Duration="{duration}",PresentationId="{PresentationId}")'
     stdout, stderr = await execute_local_command(command, timeout=15.0)
     if stderr:
         logger.warning(f"Subprocess load error: {stderr}")
@@ -217,7 +294,7 @@ async def subproc_loadrun_i2_pres(flavor: str, PresentationId: str, duration: in
     logger.info(f"Subprocess: Loaded and running presentation {PresentationId} with flavor {flavor} for {duration} minutes.")
 
 
-async def subproc_cancel_i2_pres(PresentationId: str) -> None:
+async def subproc_cancel_i2_pres(PresentationId: str) -> tuple[str, str]:
     """Cancel an i2 presentation via local subprocess."""
     command = f'"{i2exec}" cancelPres(PresentationId="{PresentationId}")'
     stdout, stderr = await execute_local_command(command, timeout=15.0)
@@ -303,7 +380,6 @@ async def udp_run_i2_pres(
     command = f'<MSG><Exec workRequest="runPres(File={0},PresentationId={PresentationId})" /></MSG>'
     return await execute_udp_message(hostname=hostname, port=port, message=command)
 
-# Aliases for consistent naming
 execute_udp_run_i2_pres = udp_run_i2_pres
 
 async def udp_loadrun_i2_pres(

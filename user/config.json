@@ -1,8 +1,14 @@
 {
     "system": {
         "logLevel": "DEBUG",
-        "cancelPresentationsOnExit": true,
-        "logSTDOUT": true
+        "cancelPresentationsOnExit": false,
+        "logSTDOUT": true,
+        "performance": {
+            "maxThreads": 16,
+            "schedulerPollIntervalMs": 50,
+            "cacheUpdateIntervalSec": 2,
+            "repingIntervalSec": 120
+        }
     },
     "outputs": [
         {

@@ -19,6 +19,52 @@ import queue
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from datetime import datetime, timedelta
+from typing import Optional
+
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+def get_optimal_thread_count(max_threads: int = 16, scale_factor: float = 1.0) -> int:
+    """Calculate optimal thread count based on CPU cores and config limit.
+    
+    Args:
+        max_threads: Maximum threads allowed (from config)
+        scale_factor: Multiplier for I/O-bound (>1) vs CPU-bound (<1) work
+    
+    Returns:
+        Optimal number of threads for the workload
+    """
+    try:
+        cpu_count = os.cpu_count() or 2
+        optimal = int(min(cpu_count * scale_factor, max_threads))
+        return max(2, optimal)
+    except Exception:
+        return 4
+
+_perf_config = {
+    'maxThreads': 16,
+    'schedulerPollIntervalMs': 50,
+    'cacheUpdateIntervalSec': 2,
+    'repingIntervalSec': 120
+}
+
+def load_performance_config(config: dict) -> None:
+    """Load performance settings from config dict."""
+    global _perf_config
+    perf = config.get('system', {}).get('performance', {})
+    _perf_config.update({
+        'maxThreads': perf.get('maxThreads', 16),
+        'schedulerPollIntervalMs': perf.get('schedulerPollIntervalMs', 50),
+        'cacheUpdateIntervalSec': perf.get('cacheUpdateIntervalSec', 2),
+        'repingIntervalSec': perf.get('repingIntervalSec', 120)
+    })
+    provision.configure_executor(_perf_config['maxThreads'])
+    logger.info(f"Performance config loaded: maxThreads={_perf_config['maxThreads']}, "
+                f"pollInterval={_perf_config['schedulerPollIntervalMs']}ms")
+
+def get_perf_config() -> dict:
+    """Get current performance configuration."""
+    return _perf_config.copy()
 
 try:
     import telnetlib3
@@ -189,15 +235,35 @@ class ConnectionThread(QtCore.QThread):
         super().__init__()
         self.controller = controller
         self.scheduler = scheduler
+        self.loop = None
+        self._stop_requested = False
 
     def run(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
         try:
             tasks = [self.controller.get_all_output_clients()]
-            loop.run_until_complete(asyncio.gather(*tasks))
+            self.loop.run_until_complete(asyncio.gather(*tasks))
+        except Exception as e:
+            logger.error(f"ConnectionThread error: {e}")
         finally:
-            loop.close()
+            try:
+                pending = asyncio.all_tasks(self.loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception as e:
+                logger.debug(f"Error during ConnectionThread cleanup: {e}")
+            finally:
+                self.loop.close()
+                self.loop = None
+    
+    def stop(self):
+        """Request the thread to stop gracefully."""
+        self._stop_requested = True
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
 
 class OutputCapture(QtCore.QObject):
     text_written = QtCore.pyqtSignal(str)
@@ -453,7 +519,7 @@ class ClientDialog(QtWidgets.QDialog):
         self.port_edit.setText(str(creds.get('port', 22)))
         self.user_edit.setText(creds.get('user', ''))
         self.pass_edit.setText(creds.get('password', ''))
-        self.su_edit.setText(creds.get('su', ''))
+        self.su_edit.setText(creds.get('su') or '')
 
     def get_data(self):
         star = self.star_type_combo.currentData()
@@ -472,7 +538,7 @@ class ClientDialog(QtWidgets.QDialog):
                 "port": int(self.port_edit.text()) if self.port_edit.text().isdigit() else 22,
                 "user": self.user_edit.text(),
                 "password": self.pass_edit.text(),
-                "su": self.su_edit.text() if self.su_edit.isVisible() and self.su_edit.text() else None
+                "su": self.su_edit.text() if self.su_edit.text() else None
             }
         }
 
@@ -554,7 +620,7 @@ class ClientActionCard(QtWidgets.QFrame):
         self.action_combo.currentTextChanged.connect(self.on_action_changed)
         header_layout.addWidget(self.action_combo)
         header_layout.addStretch()
-        del_btn = QtWidgets.QPushButton("×")
+        del_btn = QtWidgets.QPushButton("x")
         del_btn.setFixedSize(20, 20)
         del_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         del_btn.setStyleSheet("""
@@ -563,7 +629,7 @@ class ClientActionCard(QtWidgets.QFrame):
                 color: #666; 
                 border: none;
                 font-weight: light;
-                font-size: 22px;
+                font-size: 20px;
                 padding-bottom: 2px;
             }
             QPushButton:hover { 
@@ -863,7 +929,14 @@ class ClientCard(QtWidgets.QFrame):
         """)
         name_row.addWidget(proto_lbl)
         info_layout.addLayout(name_row)
-        host_lbl = QtWidgets.QLabel(f"{self.star_type.upper()} | {self.user}@{self.hostname}:{self.port}")
+        if self.protocol.lower() == "udp":
+            host_lbl = QtWidgets.QLabel(f"{self.star_type.upper()} | @{self.hostname}:{self.port}")
+        elif self.protocol.lower() == "ssh" or self.protocol.lower() == "telnet":
+            host_lbl = QtWidgets.QLabel(f"{self.star_type.upper()} | {self.user}@{self.hostname}:{self.port}")
+        elif self.protocol.lower() == "subprocess":
+            host_lbl = QtWidgets.QLabel(f"{self.star_type.upper()} | C:\\Program Files (x86)\\TWC\\I2\\exec.exe")
+        else:
+            host_lbl = QtWidgets.QLabel(f"{self.star_type.upper()} | Unknown transport protocol.")
         host_lbl.setStyleSheet("font-size: 12px; color: #888888; border: none; background: transparent;")
         info_layout.addWidget(host_lbl)
         id_lbl = QtWidgets.QLabel(f"ID: {self.client.get('id', 'N/A')}")
@@ -909,7 +982,7 @@ class ClientCard(QtWidgets.QFrame):
         """)
         if self.edit_callback:
             self.edit_btn.clicked.connect(lambda: self.edit_callback(self.client))
-        self.del_btn = QtWidgets.QPushButton("DELETE")
+        self.del_btn = QtWidgets.QPushButton("x")
         self.del_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.del_btn.setFixedSize(32, 32)
         self.del_btn.setStyleSheet("""
@@ -1400,36 +1473,30 @@ class QuickTimeEventTab(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         form_widget = QtWidgets.QWidget()
         self.form = QtWidgets.QFormLayout(form_widget)
-        self.category_combo = QtWidgets.QComboBox()
-        self.category_combo.addItems(["Cue Presentation", "Custom Command", "Cancel Presentation"])
-        self.category_combo.currentTextChanged.connect(self._update_visibility)
-        self.form.addRow("Category:", self.category_combo)
         self.target_id_edit = QtWidgets.QLineEdit()
-        self.form.addRow("Presentation ID:", self.target_id_edit)
+        self.target_id_edit.setVisible(False)
         self.custom_cmd_edit = QtWidgets.QLineEdit()
-        self.form.addRow("Custom Command:", self.custom_cmd_edit)
+        self.custom_cmd_edit.setVisible(False)
         self.length_edit = QtWidgets.QLineEdit()
         self.length_edit.setText("60")
-        self.form.addRow("Length (Seconds):", self.length_edit)
-        
+        self.length_edit.setVisible(False)
+        self.client_select_widget = QtWidgets.QWidget()
+        self.client_select_widget.setVisible(False)
+        self.client_list = QtWidgets.QListWidget()
         self.mapping_widget = QtWidgets.QWidget()
         mapping_layout = QtWidgets.QVBoxLayout(self.mapping_widget)
         mapping_layout.setContentsMargins(0,0,0,0)
-        
         self.cards_layout = QtWidgets.QVBoxLayout()
         self.cards_layout.setSpacing(4)
         self.cards_layout.addStretch()
-        
         cards_scroll = QtWidgets.QScrollArea()
         cards_scroll.setWidgetResizable(True)
         cards_scroll.setMinimumHeight(400)
         cards_scroll.setStyleSheet("QScrollArea { border: 1px solid #444; background: #222; }")
-        
         cards_content = QtWidgets.QWidget()
         cards_content.setLayout(self.cards_layout)
         cards_scroll.setWidget(cards_content)
         mapping_layout.addWidget(cards_scroll)
-        
         btn_layout = QtWidgets.QHBoxLayout()
         self.add_client_btn = QtWidgets.QPushButton("+ Add Client Action")
         self.add_client_btn.clicked.connect(lambda: self._add_action_card())
@@ -1449,24 +1516,6 @@ class QuickTimeEventTab(QtWidgets.QWidget):
         btn_layout.addStretch()
         mapping_layout.addLayout(btn_layout)
         self.form.addRow("Client Actions:", self.mapping_widget)
-        self.client_select_widget = QtWidgets.QWidget()
-        client_select_layout = QtWidgets.QVBoxLayout(self.client_select_widget)
-        client_select_layout.setContentsMargins(0,0,0,0)
-        self.client_list = QtWidgets.QListWidget()
-        self.client_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
-        self.client_list.setFixedHeight(100)
-        
-        for client in self.clients:
-             cid = client.get('id') or client.get('star', 'unknown')
-             name = client.get('displayName') or client.get('star') or cid
-             item = QtWidgets.QListWidgetItem(f"{name} ({cid})")
-             item.setData(QtCore.Qt.ItemDataRole.UserRole, cid)
-             item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-             item.setCheckState(QtCore.Qt.CheckState.Checked) 
-             self.client_list.addItem(item)
-             
-        client_select_layout.addWidget(self.client_list)
-        self.form.addRow("Clients:", self.client_select_widget)
 
         layout.addWidget(form_widget)
         
@@ -1477,7 +1526,6 @@ class QuickTimeEventTab(QtWidgets.QWidget):
         layout.addWidget(self.exec_btn)
         layout.addStretch()
         self._add_action_card({'star': 'i2xd', 'flavor': 'domestic/awesomefreakingforecast'})
-        self._update_visibility()
 
     def _add_action_card(self, initial_data=None):
         if initial_data and 'star' in initial_data and 'client_id' not in initial_data:
@@ -1505,20 +1553,16 @@ class QuickTimeEventTab(QtWidgets.QWidget):
             card.deleteLater()
 
     def _update_visibility(self):
-        cat = self.category_combo.currentText()
-        is_cue = (cat == "Cue Presentation")
-        is_custom = (cat == "Custom Command")
-        is_cancel = (cat == "Cancel Presentation")
-        self.target_id_edit.setVisible(is_cancel)
-        self.form.labelForField(self.target_id_edit).setVisible(is_cancel)
-        self.custom_cmd_edit.setVisible(is_custom)
-        self.form.labelForField(self.custom_cmd_edit).setVisible(is_custom)
+        self.target_id_edit.setVisible(False)
+        self.form.labelForField(self.target_id_edit).setVisible(False)
+        self.custom_cmd_edit.setVisible(False)
+        self.form.labelForField(self.custom_cmd_edit).setVisible(False)
         self.length_edit.setVisible(False)
         self.form.labelForField(self.length_edit).setVisible(False)
-        self.mapping_widget.setVisible(is_cue)
-        self.form.labelForField(self.mapping_widget).setVisible(is_cue)
-        self.client_select_widget.setVisible(not is_cue)
-        self.form.labelForField(self.client_select_widget).setVisible(not is_cue)
+        self.mapping_widget.setVisible(True)
+        self.form.labelForField(self.mapping_widget).setVisible(True)
+        self.client_select_widget.setVisible(False)
+        self.form.labelForField(self.client_select_widget).setVisible(False)
 
     def _execute(self):
         cat = self.category_combo.currentText()
@@ -1555,7 +1599,7 @@ class QuickTimeEventTab(QtWidgets.QWidget):
             t.start()
     async def _run_batch_logic_async(self, cat, target_clients, client_configs, target_id, custom_cmd, length):
         clients = self.controller.get_configured_clients()
-        logger.info("Executing Quick Time Event batch (async)...")
+        logger.info("Executing Quick Time Event batch...")
         
         tasks = []
         for client in clients:
@@ -1580,117 +1624,225 @@ class QuickTimeEventTab(QtWidgets.QWidget):
         port = creds.get('port', 22)
         star_type = client.get('star', 'unknown')
         protocol = client.get('protocol', 'ssh')
-        action = conf.get('action')
-        flavor = conf.get('flavor')
-        pres_id = conf.get('presentation_id') or target_id
-        duration = int(conf.get('duration') or length) * 30
+        
+        action = conf.get('action', 'LoadRun')
+        flavor = conf.get('flavor', '')
+        pres_id = conf.get('presentation_id', '') or target_id
+        duration_seconds = int(conf.get('duration', length)) if str(conf.get('duration', length)).isdigit() else 60
+        duration = duration_seconds * 30
         ldl_state = conf.get('ldl_state', '1')
-        su = creds.get('su', 'dgadmin') if star_type == 'i1' else creds.get('su', None)
+        cmd = conf.get('command', '') or custom_cmd
+        
+        is_i1 = (star_type == 'i1')
+        su = creds.get('su', 'dgadmin') if is_i1 else creds.get('su', None)
+        
+        def log_result(res, cmd_info):
+            """Log execution result to client logs."""
+            output = f"[COMMAND] {cmd_info}\n"
+            if res and isinstance(res, tuple) and len(res) == 2:
+                stdout, stderr = res
+                if stdout.strip():
+                    output += f"[STDOUT]\n{stdout}\n"
+                if stderr.strip():
+                    output += f"[STDERR]\n{stderr}\n"
+            self.controller.client_manager.log_output(cid, output)
         
         try:
-            if protocol == 'ssh':
-                if cat == "Cue Presentation":
-                    if star_type == 'i1' and action == "LDL (On/Off)":
-                        target_state = int(ldl_state) if str(ldl_state).isdigit() else 1
-                        await provision.ssh_toggleldl_i1(
-                            hostname=hostname, user=user, password=password, port=port,
-                            state=target_state, su=su
-                        )
-                    elif star_type.startswith('i2'):
-                        await provision.ssh_loadrun_i2_pres(
-                            hostname=hostname, user=user, password=password, port=port,
-                            flavor=flavor, PresentationId=pres_id, duration=duration, su=su
-                        )
-                    elif star_type == 'i1':
-                        await provision.ssh_loadrun_i1_pres(
-                            hostname=hostname, user=user, password=password, port=port,
-                            flavor=flavor, PresentationId="local", su=su
-                        )
-                elif cat == "Cancel Presentation":
+            if cat == "Custom Command" or action == "Custom Command":
+                cmd_info = f"{protocol.upper()} Custom: {cmd[:50]}..." if len(cmd) > 50 else f"{protocol.upper()} Custom: {cmd}"
+                res = None
+                if protocol == 'ssh':
+                    res = await provision.execute_ssh_command(
+                        hostname=hostname, user=user, password=password, port=port,
+                        command=cmd, su=su
+                    )
+                elif protocol == 'telnet':
+                    telnet_port = int(port) if port else 23
+                    res = await provision.execute_telnet_command(
+                        hostname=hostname, port=telnet_port, command=cmd
+                    )
+                elif protocol == 'udp':
+                    udp_port = int(port) if port else 7787
+                    await provision.execute_udp_message(
+                        hostname=hostname, port=udp_port, message=cmd
+                    )
+                log_result(res, cmd_info)
+                return
+
+            if cat == "Cancel Presentation" or action == "Cancel":
+                cmd_info = f"{protocol.upper()} Cancel pres_id={pres_id}"
+                res = None
+                if protocol == 'ssh':
                     if star_type.startswith('i2'):
-                        await provision.execute_ssh_command(
+                        res = await provision.execute_ssh_command(
                             hostname=hostname, user=user, password=password, port=port,
                             command=f'"{provision.i2exec}" cancelPres(PresentationId="{pres_id}")', su=su
                         )
-                elif cat == "Custom Command":
-                    await provision.execute_ssh_command(
-                        hostname=hostname, user=user, password=password, port=port,
-                        command=custom_cmd, su=su
-                    )
-                    
-            elif protocol == 'telnet':
-                telnet_port = int(port) if port else 23
-                if cat == "Cue Presentation":
-                    if star_type == 'i1' and action == "LDL (On/Off)":
-                        target_state = int(ldl_state) if str(ldl_state).isdigit() else 1
-                        await provision.telnet_toggleldl_i1(
-                            hostname=hostname, port=telnet_port,
-                            state=target_state, su=su, user=user, password=password
-                        )
-                    elif star_type.startswith('i2'):
-                        await provision.telnet_loadrun_i2_pres(
-                            hostname=hostname, port=telnet_port,
-                            flavor=flavor, PresentationId=pres_id, duration=duration,
-                            user=user, password=password
-                        )
-                    elif star_type == 'i1':
-                        await provision.telnet_loadrun_i1_pres(
-                            hostname=hostname, port=telnet_port,
-                            flavor=flavor, PresentationId="local",
-                            user=user, password=password
-                        )
-                elif cat == "Cancel Presentation":
+                elif protocol == 'telnet':
+                    telnet_port = int(port) if port else 23
                     if star_type.startswith('i2'):
-                        await provision.telnet_cancel_i2_pres(
+                        res = await provision.telnet_cancel_i2_pres(
                             hostname=hostname, port=telnet_port,
                             PresentationId=pres_id, user=user, password=password
                         )
-                elif cat == "Custom Command":
-                    await provision.execute_telnet_command(
-                        hostname=hostname, port=telnet_port, command=custom_cmd
-                    )
-                    
-            elif protocol == 'udp':
-                udp_port = int(port) if port else 7787
-                if cat == "Cue Presentation":
-                    if star_type.startswith('i2'):
-                        await provision.execute_udp_load_i2_pres(
-                            hostname=hostname, port=udp_port,
-                            flavor=flavor, PresentationId=pres_id, duration=duration
-                        )
-                        await provision.execute_udp_run_i2_pres(
-                            hostname=hostname, port=udp_port, PresentationId=pres_id
-                        )
-                    elif star_type == 'i1':
-                        logger.warning(f"UDP ingest for IntelliStar is not supported. (Client: {cid})")
-                elif cat == "Cancel Presentation":
+                elif protocol == 'udp':
+                    udp_port = int(port) if port else 7787
                     if star_type.startswith('i2'):
                         await provision.execute_udp_cancel_i2_pres(
                             hostname=hostname, port=udp_port, PresentationId=pres_id
                         )
-                elif cat == "Custom Command":
-                    await provision.execute_udp_message(
-                        hostname=hostname, port=udp_port, message=custom_cmd
+                elif protocol == 'subprocess':
+                    res = await provision.subproc_cancel_i2_pres(PresentationId=pres_id)
+                log_result(res, cmd_info)
+                return
+            
+            if is_i1 and action == "LDL (On/Off)":
+                target_state = int(ldl_state) if str(ldl_state).isdigit() else 1
+                cmd_info = f"{protocol.upper()} i1 LDL Toggle state={target_state}"
+                res = None
+                if protocol == 'ssh':
+                    res = await provision.ssh_toggleldl_i1(
+                        hostname=hostname, user=user, password=password, port=port,
+                        state=target_state, su=su
                     )
-                    
-            elif protocol == 'subprocess':
-                if cat == "Cue Presentation":
-                    await provision.subproc_loadrun_i2_pres(
-                        flavor=flavor, PresentationId=pres_id, duration=duration
+                elif protocol == 'telnet':
+                    telnet_port = int(port) if port else 23
+                    res = await provision.telnet_toggleldl_i1(
+                        hostname=hostname, port=telnet_port,
+                        state=target_state, su=su, user=user, password=password
                     )
-                elif cat == "Cancel Presentation":
-                    await provision.subproc_cancel_i2_pres(PresentationId=pres_id)
+                log_result(res, cmd_info)
+                return
+
+            final_id = pres_id if pres_id else ('local' if is_i1 else '1')
+            i_type = "i1" if is_i1 else "i2"
+            cmd_info = f"{protocol.upper()} {i_type} {action} pres={final_id}"
+            res = None
+            
+            if is_i1:
+                if action == "LoadRun":
+                    if protocol == 'ssh':
+                        res = await provision.ssh_loadrun_i1_pres(
+                            hostname=hostname, user=user, password=password, port=port,
+                            flavor=flavor, PresentationId=final_id, su=su
+                        )
+                    elif protocol == 'telnet':
+                        telnet_port = int(port) if port else 23
+                        res = await provision.telnet_loadrun_i1_pres(
+                            hostname=hostname, port=telnet_port,
+                            flavor=flavor, PresentationId=final_id,
+                            user=user, password=password, su=su
+                        )
+                elif action == "Load":
+                    if protocol == 'ssh':
+                        res = await provision.ssh_load_i1_pres(
+                            hostname=hostname, user=user, password=password, port=port,
+                            flavor=flavor, PresentationId=final_id, su=su
+                        )
+                    elif protocol == 'telnet':
+                        telnet_port = int(port) if port else 23
+                        res = await provision.telnet_load_i1_pres(
+                            hostname=hostname, port=telnet_port,
+                            flavor=flavor, PresentationId=final_id,
+                            user=user, password=password, su=su
+                        )
+                elif action == "Run":
+                    if protocol == 'ssh':
+                        res = await provision.ssh_run_i1_pres(
+                            hostname=hostname, user=user, password=password, port=port,
+                            flavor=flavor, PresentationId=final_id, su=su
+                        )
+                    elif protocol == 'telnet':
+                        telnet_port = int(port) if port else 23
+                        res = await provision.telnet_run_i1_pres(
+                            hostname=hostname, port=telnet_port,
+                            flavor=flavor, PresentationId=final_id,
+                            user=user, password=password, su=su
+                        )
+            else:
+                if action == "LoadRun":
+                    if protocol == 'ssh':
+                        res = await provision.ssh_loadrun_i2_pres(
+                            hostname=hostname, user=user, password=password, port=port,
+                            flavor=flavor, PresentationId=final_id, duration=duration, su=su
+                        )
+                    elif protocol == 'telnet':
+                        telnet_port = int(port) if port else 23
+                        res = await provision.telnet_loadrun_i2_pres(
+                            hostname=hostname, port=telnet_port,
+                            flavor=flavor, PresentationId=final_id, duration=duration,
+                            user=user, password=password
+                        )
+                    elif protocol == 'udp':
+                        udp_port = int(port) if port else 7787
+                        await provision.execute_udp_load_i2_pres(
+                            hostname=hostname, port=udp_port,
+                            flavor=flavor, PresentationId=final_id, duration=duration
+                        )
+                        await provision.execute_udp_run_i2_pres(
+                            hostname=hostname, port=udp_port, PresentationId=final_id
+                        )
+                        cmd_info = f"UDP i2 LoadRun pres={final_id} (Load+Run)"
+                    elif protocol == 'subprocess':
+                        res = await provision.subproc_loadrun_i2_pres(
+                            flavor=flavor, PresentationId=final_id, duration=duration
+                        )
+                elif action == "Load":
+                    if protocol == 'ssh':
+                        res = await provision.ssh_load_i2_pres(
+                            hostname=hostname, user=user, password=password, port=port,
+                            flavor=flavor, PresentationId=final_id, duration=duration, su=su
+                        )
+                    elif protocol == 'telnet':
+                        telnet_port = int(port) if port else 23
+                        res = await provision.telnet_load_i2_pres(
+                            hostname=hostname, port=telnet_port,
+                            flavor=flavor, PresentationId=final_id, duration=duration,
+                            user=user, password=password
+                        )
+                    elif protocol == 'udp':
+                        udp_port = int(port) if port else 7787
+                        await provision.execute_udp_load_i2_pres(
+                            hostname=hostname, port=udp_port,
+                            flavor=flavor, PresentationId=final_id, duration=duration
+                        )
+                    elif protocol == 'subprocess':
+                        res = await provision.subproc_load_i2_pres(
+                            flavor=flavor, PresentationId=final_id, duration=duration
+                        )
+                elif action == "Run":
+                    if protocol == 'ssh':
+                        res = await provision.ssh_run_i2_pres(
+                            hostname=hostname, user=user, password=password, port=port,
+                            PresentationId=final_id, su=su
+                        )
+                    elif protocol == 'telnet':
+                        telnet_port = int(port) if port else 23
+                        res = await provision.telnet_run_i2_pres(
+                            hostname=hostname, port=telnet_port,
+                            PresentationId=final_id,
+                            user=user, password=password
+                        )
+                    elif protocol == 'udp':
+                        udp_port = int(port) if port else 7787
+                        await provision.execute_udp_run_i2_pres(
+                            hostname=hostname, port=udp_port, PresentationId=final_id
+                        )
+                    elif protocol == 'subprocess':
+                        res = await provision.subproc_run_i2_pres(PresentationId=final_id)
+            
+            log_result(res, cmd_info)
                     
         except Exception as e:
             logger.error(f"[{cid}] Quick Time Event error: {e}")
     
-    def _run_batch_logic_sync(self, cat, target_clients, client_configs, target_id, custom_cmd, length):
+    def _run_batch_logic_sync(self, target_clients, client_configs):
         """Fallback sync batch execution."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(
-                self._run_batch_logic_async(cat, target_clients, client_configs, target_id, custom_cmd, length)
+                self._run_batch_logic_async(target_clients, client_configs)
             )
         finally:
             loop.close()
@@ -1958,9 +2110,7 @@ class HomeTab(QtWidgets.QWidget):
         """)
         
         add_btn.clicked.connect(self._open_add_client_dialog)
-        
         header.addWidget(add_btn)
-        
         refresh_btn = QtWidgets.QPushButton("🔄 Refresh")
         refresh_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         refresh_btn.setStyleSheet("""
@@ -1980,15 +2130,12 @@ class HomeTab(QtWidgets.QWidget):
         """)
         
         refresh_btn.clicked.connect(self._trigger_ping)
-        
         header.addWidget(refresh_btn)
         layout.addLayout(header)
-        
         separator = QtWidgets.QFrame()
         separator.setFrameShape(QtWidgets.QFrame.Shape.HLine)
         separator.setStyleSheet("background-color: #2d2d2d; max-height: 1px;")
         layout.addWidget(separator)
-        
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
@@ -2190,10 +2337,8 @@ class HomeTab(QtWidgets.QWidget):
             elif proto == 'telnet': tel_count += 1
 
         stats = getattr(self.controller, 'stats', {})
-        
         total_threads = threading.active_count()
         global connected_outputs
-        
         uptime_str = "0:00:00"
         if hasattr(self, 'app_start_time'):
             uptime_str = str(timedelta(seconds=int(time.time() - self.app_start_time)))
@@ -3214,8 +3359,10 @@ class star_controller:
     def __init__(self):
         with open('user/config.json', 'r') as f:
             self.config = json.load(f)
+        load_performance_config(self.config)
         self.log_proxy = LogSignalProxy()
         self.client_manager = ClientManager(self)
+        self.client_manager.set_log_callback(self._on_log)
         self.scheduler = None
         self._reping_running = True
         self.stats = {}
@@ -3228,15 +3375,19 @@ class star_controller:
             self.reping_thread = threading.Thread(target=self._reping_loop_sync, daemon=True, name="RepingThread")
             self.reping_thread.start()
     async def _reping_loop_async(self):
+        perf = get_perf_config()
+        interval = perf['repingIntervalSec']
         while self._reping_running:
-            await asyncio.sleep(120)
+            await asyncio.sleep(interval)
             try:
                 await self.get_all_output_clients()
             except Exception as e:
                 logger.error(f"Reping Error: {e}")
     def _reping_loop_sync(self):
+        perf = get_perf_config()
+        interval = perf['repingIntervalSec']
         while self._reping_running:
-            time.sleep(120)
+            time.sleep(interval)
             try:
                 asyncio.run(self.get_all_output_clients())
             except Exception as e:
@@ -3282,8 +3433,8 @@ class star_controller:
                     the_thing_that_shows_when_i2service_isnt_running = "Could not connect to net.tcp://localhost:8082/ExecutionerWCFService/."
                     
                     if os.name == "nt":
-                        await provision.subproc_cancel_i2_pres(PresentationId="1")
-                        if the_thing_that_shows_when_i2service_isnt_running in stdout:
+                        stdout, stderr = await provision.subproc_cancel_i2_pres(PresentationId="1")
+                        if the_thing_that_shows_when_i2service_isnt_running in stdout or the_thing_that_shows_when_i2service_isnt_running in stderr:
                             return None
                     else:
                         logger.info("This isn't Windows... How are you even running I2 on this thing???????")
@@ -3347,18 +3498,44 @@ class star_controller:
         clients = self.get_configured_clients()
     
 class ClientWorker:
+    """Lightweight worker for client-specific tasks with dynamic thread allocation."""
+    _shared_executor: Optional[ThreadPoolExecutor] = None
+    _executor_lock = threading.Lock()
+    
+    @classmethod
+    def get_shared_executor(cls) -> ThreadPoolExecutor:
+        """Get or create a shared executor for all client workers (reduces thread overhead)."""
+        if cls._shared_executor is None:
+            with cls._executor_lock:
+                if cls._shared_executor is None:
+                    perf = get_perf_config()
+                    worker_count = get_optimal_thread_count(perf['maxThreads'], scale_factor=0.5)
+                    cls._shared_executor = ThreadPoolExecutor(
+                        max_workers=worker_count,
+                        thread_name_prefix="ClientWorker"
+                    )
+                    logger.info(f"ClientWorker shared executor: {worker_count} workers")
+        return cls._shared_executor
+    
+    @classmethod
+    def shutdown_shared_executor(cls):
+        """Shutdown the shared executor on application exit."""
+        if cls._shared_executor:
+            cls._shared_executor.shutdown(wait=False)
+            cls._shared_executor = None
+    
     def __init__(self, client_id, controller):
         self.client_id = client_id
         self.controller = controller
-        self.executor = ThreadPoolExecutor(max_workers=32, thread_name_prefix=f"Worker-{client_id}")
         self.running = True
         
     def _run_task(self, task):
         pass
     
     def submit_task(self, task):
-        if not self.running: return
-        self.executor.submit(self._execute_safe, task)
+        if not self.running:
+            return
+        self.get_shared_executor().submit(self._execute_safe, task)
 
     def _execute_safe(self, task):
         try:
@@ -3368,7 +3545,6 @@ class ClientWorker:
     
     def stop(self):
         self.running = False
-        self.executor.shutdown(wait=False)
 
 class ClientManager:
     def __init__(self, controller=None):
@@ -3440,6 +3616,8 @@ class LogSignalProxy(QtCore.QObject):
     log_received = QtCore.pyqtSignal(str, str)
 
 class scheduler:
+    """High-efficiency event scheduler with configurable polling intervals."""
+    
     def __init__(self, controller):
         self.controller = controller
         self.timetable_file = os.path.join(os.path.dirname(__file__), "user", "timetable.xml")
@@ -3459,15 +3637,22 @@ class scheduler:
         self.total_client_warnings = 0
         self.next_event_dt = None
         self.loop = None
+        
+        # Load performance config
+        self._perf = get_perf_config()
+        self._cache_interval = self._perf['cacheUpdateIntervalSec']
+        self._poll_interval_sec = self._perf['schedulerPollIntervalMs'] / 1000.0
+        
         self.cache_thread = threading.Thread(target=self._cache_loop, daemon=True, name="SchedulerCacheThread")
         self.cache_thread.start()
         self.thread = threading.Thread(target=self._run_async_loop, daemon=True, name="SchedulerLoopThread")
         self.thread.start()
 
     def _cache_loop(self):
+        """Cache update loop with configurable interval."""
         while self.running:
             self._update_cache()
-            time.sleep(1)
+            time.sleep(self._cache_interval)
 
     def _update_cache(self):
         try:
@@ -3805,12 +3990,15 @@ class scheduler:
             pass
 
     async def run_scheduler_loop(self):
+        """Main scheduler loop with CPU-efficient polling."""
         last_second = -1
         next_calc_time = time.monotonic()
+        poll_interval = self._poll_interval_sec
+
         while self.cached_mtime == 0 and self.running:
-             await asyncio.sleep(0.05)
+             await asyncio.sleep(poll_interval)
         
-        logger.info("Scheduler loop started with high-precision timing.")
+        logger.info(f"Scheduler loop started (poll interval: {poll_interval*1000:.0f}ms)")
         
         while self.running:
             loop_start = time.monotonic()
@@ -3828,18 +4016,21 @@ class scheduler:
                        self.startup_event_fired = True
                 now = datetime.now()
                 current_second = now.second
+                
                 if time.monotonic() > next_calc_time:
                     self._update_prediction(now)
                     next_calc_time = time.monotonic() + 5.0
+
                 if self.next_event_dt:
                     diff = self.next_event_dt - now
                     if diff.total_seconds() > 0:
                         self.next_event_countdown = str(diff).split('.')[0]
                     else:
                         self.next_event_countdown = "00:00:00"
+
                 if current_second == last_second:
                     sleep_time = max(0.001, 1.0 - (now.microsecond / 1_000_000.0) - 0.002)
-                    await asyncio.sleep(min(sleep_time, 0.05))
+                    await asyncio.sleep(min(sleep_time, poll_interval))
                     continue
                 last_second = current_second
                 next_minute = now + timedelta(minutes=1)
@@ -3849,10 +4040,11 @@ class scheduler:
                 trigger_run_std = (current_second == 52)
                 trigger_load_i1 = (current_second == 48)
                 trigger_run_i1 = (current_second == 58)
-                
+
                 if not any([trigger_load_std, trigger_load_i1, trigger_run_std, trigger_run_i1]):
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(poll_interval)
                     continue
+                    
                 all_events = self.grab_all_events()
                 matching_events = []
                 for event in all_events:
@@ -3867,9 +4059,10 @@ class scheduler:
                 }
                 for ev in matching_events:
                     asyncio.create_task(self._execute_single_event(ev, t_ctx))
+
                 loop_elapsed = time.monotonic() - loop_start
-                if loop_elapsed < 0.01:
-                    await asyncio.sleep(0.01 - loop_elapsed)
+                if loop_elapsed < poll_interval:
+                    await asyncio.sleep(poll_interval - loop_elapsed)
             except Exception as e:
                 logger.error(f"Scheduler Loop Error: {e}")
                 await asyncio.sleep(0.5)
@@ -4004,12 +4197,23 @@ class scheduler:
         except Exception as e:
             logger.error(f"Error in _execute_single_event: {e}")
 
-    def _log_execution_result(self, client_id, res):
+    def _log_execution_result(self, client_id, res, command_info=None):
+        """Log execution results to client logs. Always logs regardless of config."""
+        output = ""
+
+        if not command_info:
+            stats = self.controller.stats
+            command_info = stats.get('ssh_last') or stats.get('telnet_last') or stats.get('sub_last') or stats.get('udp_last') or ""
+
+        if command_info:
+            output += f"[COMMAND] {command_info}\n"
+        
         if not res or not isinstance(res, tuple) or len(res) != 2:
+            if output:
+                self.controller.client_manager.log_output(client_id, output)
             return
         
         stdout, stderr = res
-        output = ""
         
         runtime_error_strings = [
             "Neither a playlist nor a copy split was generated.",
@@ -4038,7 +4242,7 @@ class scheduler:
         if stderr.strip(): 
              output += f"[STDERR]\n{stderr}\n"
              logger.warning(f"[{client_id}] STDERR: {stderr.strip()}")
-        
+
         if output:
             self.controller.client_manager.log_output(client_id, output)
 
@@ -4452,6 +4656,9 @@ if __name__ == "__main__":
     
     if controller.config['system'].get("cancelPresentationsOnExit", True):
         def on_exit():
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
@@ -4478,5 +4685,26 @@ if __name__ == "__main__":
 
     conn_thread = ConnectionThread(controller, scheduler=ui.scheduler_tab.scheduler)
     conn_thread.start()
-
-    sys.exit(app.exec())
+    
+    def cleanup_on_exit():
+        """Cleanup function to properly stop threads before exit."""
+        try:
+            if conn_thread.isRunning():
+                conn_thread.stop()
+                conn_thread.wait(1200)
+                if conn_thread.isRunning():
+                    conn_thread.terminate()
+        except Exception as e:
+            logger.debug(f"Cleanup error: {e}")
+    
+    app.aboutToQuit.connect(cleanup_on_exit)
+    
+    try:
+        exit_code = app.exec()
+    except Exception as e:
+        logger.error(f"Application error: {e}")
+        exit_code = 1
+    finally:
+        cleanup_on_exit()
+    
+    sys.exit(exit_code)
