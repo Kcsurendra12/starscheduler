@@ -2521,7 +2521,7 @@ class SchedulerTab(QtWidgets.QWidget):
                 
                 if matches:
                     item.setBackground(QtGui.QColor("#3A4E3A"))
-                    item.setData(QtCore.Qt.UserRole, True)
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, True)
                     container = QtWidgets.QWidget()
                     container.setStyleSheet("background: transparent;")
                     layout = QtWidgets.QHBoxLayout(container)
@@ -2545,7 +2545,7 @@ class SchedulerTab(QtWidgets.QWidget):
                         
                     self.table.setCellWidget(r, c, container)
                 else:
-                    item.setData(QtCore.Qt.UserRole, False)
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, False)
                 
                 self.table.setItem(r, c, item)
         
@@ -2613,7 +2613,7 @@ class SchedulerTab(QtWidgets.QWidget):
              for c in range(self.table.columnCount()):
                  item = self.table.item(self.last_highlighted_row, c)
                  if item:
-                     if item.data(QtCore.Qt.UserRole):
+                     if item.data(QtCore.Qt.ItemDataRole.UserRole):
                          item.setBackground(event_color)
                      else:
                          item.setBackground(zebra_color)
@@ -3282,7 +3282,7 @@ class star_controller:
                     the_thing_that_shows_when_i2service_isnt_running = "Could not connect to net.tcp://localhost:8082/ExecutionerWCFService/."
                     
                     if os.name == "nt":
-                        provision.subproc_cancel_i2_pres(PresentationId="1")
+                        await provision.subproc_cancel_i2_pres(PresentationId="1")
                         if the_thing_that_shows_when_i2service_isnt_running in stdout:
                             return None
                     else:
