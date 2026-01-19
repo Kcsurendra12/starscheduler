@@ -1,6 +1,6 @@
 {
     "system": {
-        "logLevel": "INFO",
+        "logLevel": "DEBUG",
         "cancelPresentationsOnExit": true,
         "logSTDOUT": true
     },
