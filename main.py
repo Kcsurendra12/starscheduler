@@ -25,15 +25,6 @@ if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 def get_optimal_thread_count(max_threads: int = 16, scale_factor: float = 1.0) -> int:
-    """Calculate optimal thread count based on CPU cores and config limit.
-    
-    Args:
-        max_threads: Maximum threads allowed (from config)
-        scale_factor: Multiplier for I/O-bound (>1) vs CPU-bound (<1) work
-    
-    Returns:
-        Optimal number of threads for the workload
-    """
     try:
         cpu_count = os.cpu_count() or 2
         optimal = int(min(cpu_count * scale_factor, max_threads))
@@ -72,8 +63,8 @@ except ImportError:
     telnetlib3 = None
     print("telnetlib3 not found; Telnet support will be disabled.")
 
-connected_outputs = 0 # count of successfully connected output clients
-connected_outputs_data = [] # to hold detailed info about each connected output client
+connected_outputs = 0
+connected_outputs_data = []
 output_widget = None
 original_stdout = sys.stdout
 original_stderr = sys.stderr
@@ -2975,6 +2966,10 @@ class user_interface:
         
         img_path = os.path.join(os.path.dirname(__file__), "img", "starscheduler_wordmark.png")
         meteo_logo_path = os.path.join(os.path.dirname(__file__), "img", "meteochannel.png")
+        mid_logo_path = os.path.join(os.path.dirname(__file__), "img", "midscheduler.png")
+        import random
+        if random.randint(1, 8) == 1 and os.path.exists(mid_logo_path):
+            img_path = mid_logo_path
         if os.path.exists(img_path) and os.path.exists(meteo_logo_path):
             pixmap = QtGui.QPixmap(img_path)
             meteo_pixmap = QtGui.QPixmap(meteo_logo_path)
@@ -3637,8 +3632,7 @@ class scheduler:
         self.total_client_warnings = 0
         self.next_event_dt = None
         self.loop = None
-        
-        # Load performance config
+
         self._perf = get_perf_config()
         self._cache_interval = self._perf['cacheUpdateIntervalSec']
         self._poll_interval_sec = self._perf['schedulerPollIntervalMs'] / 1000.0
@@ -3990,82 +3984,80 @@ class scheduler:
             pass
 
     async def run_scheduler_loop(self):
-        """Main scheduler loop with CPU-efficient polling."""
-        last_second = -1
-        next_calc_time = time.monotonic()
-        poll_interval = self._poll_interval_sec
-
+        """Main scheduler loop with 100ms polling for precise timing."""
         while self.cached_mtime == 0 and self.running:
-             await asyncio.sleep(poll_interval)
+            await asyncio.sleep(0.1)
         
-        logger.info(f"Scheduler loop started (poll interval: {poll_interval*1000:.0f}ms)")
-        
-        while self.running:
-            loop_start = time.monotonic()
-            try:
-                if not self.startup_event_fired:
-                   all_events = self.grab_all_events()
-                   if all_events:
-                       startup_tasks = []
-                       for event in all_events:
-                           if event.get('RunAtStartup', False) and event.get('Enabled', True):
-                               logger.info(f"Queuing Startup Event: {event.get('DisplayName')}")
-                               startup_tasks.append(asyncio.create_task(self._execute_single_event(event)))
-                       if startup_tasks:
-                           await asyncio.gather(*startup_tasks, return_exceptions=True)
-                       self.startup_event_fired = True
-                now = datetime.now()
-                current_second = now.second
-                
-                if time.monotonic() > next_calc_time:
-                    self._update_prediction(now)
-                    next_calc_time = time.monotonic() + 5.0
+        logger.info("Scheduler loop started (100ms precision polling)")
+        last_fired_minute = -1
+        fired_triggers = set()
+        next_prediction_update = time.monotonic()
+        TRIGGER_SECONDS = [42, 48, 52, 58]
+        if not self.startup_event_fired:
+            all_events = self.grab_all_events()
+            if all_events:
+                startup_tasks = []
+                for event in all_events:
+                    if event.get('RunAtStartup', False) and event.get('Enabled', True):
+                        logger.info(f"Queuing Startup Event: {event.get('DisplayName')}")
+                        startup_tasks.append(asyncio.create_task(self._execute_single_event(event)))
+                if startup_tasks:
+                    await asyncio.gather(*startup_tasks, return_exceptions=True)
+            self.startup_event_fired = True
 
+        while self.running:
+            try:
+                now = datetime.now()
+                current_hour = now.hour
+                current_minute = now.minute
+                current_second = now.second
+                minute_key = (current_hour, current_minute)
+                if current_minute != last_fired_minute:
+                    fired_triggers.clear()
+                    last_fired_minute = current_minute
+                if time.monotonic() > next_prediction_update:
+                    self._update_prediction(now)
+                    next_prediction_update = time.monotonic() + 5.0
                 if self.next_event_dt:
                     diff = self.next_event_dt - now
                     if diff.total_seconds() > 0:
                         self.next_event_countdown = str(diff).split('.')[0]
                     else:
                         self.next_event_countdown = "00:00:00"
-
-                if current_second == last_second:
-                    sleep_time = max(0.001, 1.0 - (now.microsecond / 1_000_000.0) - 0.002)
-                    await asyncio.sleep(min(sleep_time, poll_interval))
-                    continue
-                last_second = current_second
                 next_minute = now + timedelta(minutes=1)
                 target_event_time = next_minute.replace(second=0, microsecond=0)
                 self.next_check_time = target_event_time.strftime("%I:%M %p")
-                trigger_load_std = (current_second == 42)
-                trigger_run_std = (current_second == 52)
-                trigger_load_i1 = (current_second == 48)
-                trigger_run_i1 = (current_second == 58)
-
-                if not any([trigger_load_std, trigger_load_i1, trigger_run_std, trigger_run_i1]):
-                    await asyncio.sleep(poll_interval)
-                    continue
-                    
-                all_events = self.grab_all_events()
-                matching_events = []
-                for event in all_events:
-                    if self.does_event_match_time(event, target_event_time):
-                        matching_events.append(event)
-                t_ctx = {
-                    'trigger_load_std': trigger_load_std,
-                    'trigger_load_i1': trigger_load_i1,
-                    'trigger_run_std': trigger_run_std,
-                    'trigger_run_i1': trigger_run_i1,
-                    'target_time': target_event_time
-                }
-                for ev in matching_events:
-                    asyncio.create_task(self._execute_single_event(ev, t_ctx))
-
-                loop_elapsed = time.monotonic() - loop_start
-                if loop_elapsed < poll_interval:
-                    await asyncio.sleep(poll_interval - loop_elapsed)
+                for trigger_sec in TRIGGER_SECONDS:
+                    trigger_key = (minute_key, trigger_sec)
+                    if current_second >= trigger_sec and current_second < trigger_sec + 2:
+                        if trigger_key not in fired_triggers:
+                            fired_triggers.add(trigger_key)
+                            trigger_load_std = (trigger_sec == 42)
+                            trigger_run_std = (trigger_sec == 52)
+                            trigger_load_i1 = (trigger_sec == 48)
+                            trigger_run_i1 = (trigger_sec == 58)
+                            all_events = self.grab_all_events()
+                            matching_events = []
+                            for event in all_events:
+                                if self.does_event_match_time(event, target_event_time):
+                                    matching_events.append(event)
+                            
+                            if matching_events:
+                                t_ctx = {
+                                    'trigger_load_std': trigger_load_std,
+                                    'trigger_load_i1': trigger_load_i1,
+                                    'trigger_run_std': trigger_run_std,
+                                    'trigger_run_i1': trigger_run_i1,
+                                    'target_time': target_event_time
+                                }
+                                for ev in matching_events:
+                                    logger.info(f"Firing trigger sec={trigger_sec} for: {ev.get('DisplayName')} at {now.strftime('%H:%M:%S.%f')[:-3]}")
+                                    asyncio.create_task(self._execute_single_event(ev, t_ctx))
+                await asyncio.sleep(0.1)
+                
             except Exception as e:
                 logger.error(f"Scheduler Loop Error: {e}")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)
 
     def _update_prediction(self, now):
         try:
