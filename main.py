@@ -2362,7 +2362,7 @@ class SchedulerTab(QtWidgets.QWidget):
         self.refresh_grid()
         self.update_timer = QtCore.QTimer(self)
         self.update_timer.timeout.connect(self.update_current_time_indicator)
-        self.update_timer.start(1)
+        self.update_timer.start(500)  # Update every 500ms instead of 1ms to reduce GUI load
 
     def _setup_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
@@ -3984,15 +3984,29 @@ class scheduler:
             pass
 
     async def run_scheduler_loop(self):
-        """Main scheduler loop with 100ms polling for precise timing."""
+        """Main scheduler loop with drift-corrected 100ms polling.
+        
+        Uses a single trigger at second 48 (12 seconds before minute boundary) for I2 systems
+        with loadRunPres combo command, and separate load/run for I1 systems.
+        
+        Drift correction: Instead of sleeping for a fixed 100ms, we calculate the time
+        until the next 100ms boundary based on wall clock, preventing cumulative drift.
+        """
         while self.cached_mtime == 0 and self.running:
             await asyncio.sleep(0.1)
         
-        logger.info("Scheduler loop started (100ms precision polling)")
+        logger.info("Scheduler loop started (100ms drift-corrected polling)")
         last_fired_minute = -1
         fired_triggers = set()
         next_prediction_update = time.monotonic()
-        TRIGGER_SECONDS = [42, 48, 52, 58]
+        
+        # Track drift for logging
+        drift_check_time = time.monotonic() + 60.0  # Check drift every 60 seconds
+        expected_iterations = 0
+        actual_iterations = 0
+        
+        TRIGGER_SECONDS = [48, 58]
+        
         if not self.startup_event_fired:
             all_events = self.grab_all_events()
             if all_events:
@@ -4012,30 +4026,40 @@ class scheduler:
                 current_minute = now.minute
                 current_second = now.second
                 minute_key = (current_hour, current_minute)
+                
                 if current_minute != last_fired_minute:
                     fired_triggers.clear()
                     last_fired_minute = current_minute
+                    
                 if time.monotonic() > next_prediction_update:
                     self._update_prediction(now)
                     next_prediction_update = time.monotonic() + 5.0
+                    
                 if self.next_event_dt:
                     diff = self.next_event_dt - now
                     if diff.total_seconds() > 0:
                         self.next_event_countdown = str(diff).split('.')[0]
                     else:
                         self.next_event_countdown = "00:00:00"
+                        
                 next_minute = now + timedelta(minutes=1)
                 target_event_time = next_minute.replace(second=0, microsecond=0)
                 self.next_check_time = target_event_time.strftime("%I:%M %p")
+                
                 for trigger_sec in TRIGGER_SECONDS:
                     trigger_key = (minute_key, trigger_sec)
-                    if current_second >= trigger_sec and current_second < trigger_sec + 2:
+
+                    if current_second >= trigger_sec and current_second < trigger_sec + 10:
                         if trigger_key not in fired_triggers:
                             fired_triggers.add(trigger_key)
-                            trigger_load_std = (trigger_sec == 42)
-                            trigger_run_std = (trigger_sec == 52)
-                            trigger_load_i1 = (trigger_sec == 48)
-                            trigger_run_i1 = (trigger_sec == 58)
+
+                            seconds_late = current_second - trigger_sec
+                            if seconds_late > 2:
+                                logger.warning(f"Trigger sec={trigger_sec} is {seconds_late}s late (fired at :{current_second})")
+                            
+                            is_48_trigger = (trigger_sec == 48)
+                            is_58_trigger = (trigger_sec == 58)
+                            
                             all_events = self.grab_all_events()
                             matching_events = []
                             for event in all_events:
@@ -4044,16 +4068,34 @@ class scheduler:
                             
                             if matching_events:
                                 t_ctx = {
-                                    'trigger_load_std': trigger_load_std,
-                                    'trigger_load_i1': trigger_load_i1,
-                                    'trigger_run_std': trigger_run_std,
-                                    'trigger_run_i1': trigger_run_i1,
+                                    'trigger_i2_loadrun': is_48_trigger,
+                                    'trigger_load_i1': is_48_trigger,
+                                    'trigger_run_i1': is_58_trigger,
                                     'target_time': target_event_time
                                 }
                                 for ev in matching_events:
                                     logger.info(f"Firing trigger sec={trigger_sec} for: {ev.get('DisplayName')} at {now.strftime('%H:%M:%S.%f')[:-3]}")
                                     asyncio.create_task(self._execute_single_event(ev, t_ctx))
-                await asyncio.sleep(0.1)
+                
+                actual_iterations += 1
+                now_after = datetime.now()
+                ms = now_after.microsecond // 1000
+                ms_to_next_boundary = (100 - (ms % 100)) % 100
+                if ms_to_next_boundary == 0:
+                    ms_to_next_boundary = 100
+                sleep_time = ms_to_next_boundary / 1000.0
+                if time.monotonic() > drift_check_time:
+                    expected_iterations += 600
+                    drift_ratio = actual_iterations / expected_iterations if expected_iterations > 0 else 1.0
+                    if abs(1.0 - drift_ratio) > 0.05:
+                        logger.warning(f"Scheduler drift detected: {drift_ratio:.3f}x ({actual_iterations}/{expected_iterations} iterations)")
+                        import random
+                        randomlol = random.randint(1, 2)
+                        if randomlol == 2:
+                            logger.warning("when im in a time drift competition and my opponent is intellistar renderd:")
+                    drift_check_time = time.monotonic() + 60.0
+                
+                await asyncio.sleep(sleep_time)
                 
             except Exception as e:
                 logger.error(f"Scheduler Loop Error: {e}")
@@ -4162,24 +4204,15 @@ class scheduler:
             layers_cfg = schedule_cfg.get('layers', {})
             is_manual_cue = (category == "Cue Presentation" and not triggers)
             if is_manual_cue:
-                logger.info("Starting Synchronized Execution: Phase 1 (LOAD)")
-                load_triggers = {
-                    'trigger_load_i1': True, 'trigger_run_i1': False,
-                    'trigger_load_std': True, 'trigger_run_std': False
+                logger.info("Manual Cue: Executing loadRun combo for all clients")
+                combo_triggers = {
+                    'trigger_i2_loadrun': True,
+                    'trigger_load_i1': True,
+                    'trigger_run_i1': True
                 }
                 tasks = []
                 for client in clients:
-                    tasks.append(asyncio.create_task(self._dispatch_client_event(client, execution_map, category, load_triggers, event, layers_cfg)))
-                await asyncio.gather(*tasks)
-
-                logger.info("Starting Synchronized Execution: Phase 2 (RUN)")
-                run_triggers = {
-                    'trigger_load_i1': False, 'trigger_run_i1': True,
-                    'trigger_load_std': False, 'trigger_run_std': True
-                }
-                tasks = []
-                for client in clients:
-                    tasks.append(asyncio.create_task(self._dispatch_client_event(client, execution_map, category, run_triggers, event, layers_cfg)))
+                    tasks.append(asyncio.create_task(self._dispatch_client_event(client, execution_map, category, combo_triggers, event, layers_cfg)))
                 await asyncio.gather(*tasks)
             else:
                 tasks = []
@@ -4330,19 +4363,23 @@ class scheduler:
         if is_i1:
                 final_id = "local"
         final_flavor = raw_flavor
-        do_load = True
-        do_run = True
+        
+        do_i2_loadrun = False
+        do_i1_load = False
+        do_i1_run = False
+        
         if triggers:
-            if is_i1:
-                do_load = triggers.get('trigger_load_i1', False)
-                do_run = triggers.get('trigger_run_i1', False)
-            else:
-                do_load = triggers.get('trigger_load_std', False)
-                do_run = triggers.get('trigger_run_std', False)
+            do_i2_loadrun = triggers.get('trigger_i2_loadrun', False)
+            do_i1_load = triggers.get('trigger_load_i1', False)
+            do_i1_run = triggers.get('trigger_run_i1', False)
+        else:
+            do_i2_loadrun = True
+            do_i1_load = True
+            do_i1_run = True
 
         if is_i1:
             su = creds.get('su', 'dgadmin')
-            if do_load and do_run:
+            if do_i1_load and do_i1_run:
                 if protocol == "ssh":
                     self.controller.stats['ssh_last'] = f"i1 LoadRun {final_flavor} -> {creds.get('hostname')}"
                     res = await provision.ssh_loadrun_i1_pres(
@@ -4360,7 +4397,7 @@ class scheduler:
                     )
                     self._log_execution_result(c_id, res)
             else:
-                if do_load:
+                if do_i1_load:
                     if protocol == "ssh":
                         self.controller.stats['ssh_last'] = f"i1 Load {final_flavor} -> {creds.get('hostname')}"
                         res = await provision.ssh_load_i1_pres(
@@ -4377,7 +4414,7 @@ class scheduler:
                             user=creds.get("user"), password=creds.get("password")
                         )
                         self._log_execution_result(c_id, res)
-                if do_run:
+                if do_i1_run:
                     if protocol == "ssh":
                         self.controller.stats['ssh_last'] = f"i1 Run {final_id} -> {creds.get('hostname')}"
                         res = await provision.ssh_run_i1_pres(
@@ -4395,10 +4432,9 @@ class scheduler:
                         )
                         self._log_execution_result(c_id, res)
         else:
-            use_combined_loadrun = (do_load and do_run)
             su = creds.get('su', None)
 
-            if use_combined_loadrun:
+            if do_i2_loadrun:
                 if protocol == "ssh":
                     self.controller.stats['ssh_last'] = f"LoadRun {final_id} -> {creds.get('hostname')}"
                     res = await provision.ssh_loadrun_i2_pres(
@@ -4440,73 +4476,6 @@ class scheduler:
                             PresentationId=final_id
                         )
 
-            else:
-                if do_load:
-                    if protocol == "ssh":
-                        self.controller.stats['ssh_last'] = f"Load {final_id} -> {creds.get('hostname')}"
-                        res = await provision.ssh_load_i2_pres(
-                            hostname=creds.get("hostname"), user=creds.get("user"),
-                            password=creds.get("password"), port=creds.get("port", 22),
-                            flavor=final_flavor, PresentationId=final_id,
-                            duration=final_duration, su=su
-                        )
-                        self._log_execution_result(c_id, res)
-                    elif protocol == "telnet":
-                        self.controller.stats['telnet_last'] = f"Load {final_id} -> {creds.get('hostname')}"
-                        res = await provision.telnet_load_i2_pres(
-                            hostname=creds.get("hostname"), port=creds.get("port", 23),
-                            flavor=final_flavor, PresentationId=final_id,
-                            duration=final_duration,
-                            user=creds.get("user"), password=creds.get("password")
-                        )
-                        self._log_execution_result(c_id, res)
-                    elif protocol == "subprocess":
-                        self.controller.stats['sub_last'] = f"Load {final_id} ({final_flavor})"
-                        res = await provision.subproc_load_i2_pres(
-                            flavor=final_flavor, PresentationId=final_id,
-                            duration=final_duration
-                        )
-                        self._log_execution_result(c_id, res)
-
-                    elif protocol == "udp":
-                            self.controller.stats['udp_last'] = f"Load {final_id} -> {creds.get('hostname')}"
-                            await provision.execute_udp_load_i2_pres(
-                                hostname=creds.get("hostname"),
-                                port=int(creds.get("port", 7787)),
-                                flavor=final_flavor,
-                                PresentationId=final_id,
-                                duration=final_duration
-                            )
-                if do_run:
-                    if protocol == "ssh":
-                        self.controller.stats['ssh_last'] = f"Run {final_id} -> {creds.get('hostname')}"
-                        res = await provision.ssh_run_i2_pres(
-                            hostname=creds.get("hostname"), user=creds.get("user"),
-                            password=creds.get("password"), port=creds.get("port", 22),
-                            PresentationId=final_id, su=su
-                        )
-                        self._log_execution_result(c_id, res)
-                    elif protocol == "telnet":
-                        self.controller.stats['telnet_last'] = f"Run {final_id} -> {creds.get('hostname')}"
-                        res = await provision.telnet_run_i2_pres(
-                            hostname=creds.get("hostname"), port=creds.get("port", 23),
-                            PresentationId=final_id,
-                            user=creds.get("user"), password=creds.get("password")
-                        )
-                        self._log_execution_result(c_id, res)
-                    elif protocol == "subprocess":
-                        self.controller.stats['sub_last'] = f"Run {final_id}"
-                        res = await provision.subproc_run_i2_pres(
-                            PresentationId=final_id
-                        )
-                        self._log_execution_result(c_id, res)
-                    elif protocol == "udp":
-                            self.controller.stats['udp_last'] = f"Run {final_id} -> {creds.get('hostname')}"
-                            await provision.execute_udp_run_i2_pres(
-                                hostname=creds.get("hostname"),
-                                port=int(creds.get("port", 7787)),
-                                PresentationId=final_id
-                            )
 if __name__ == "__main__":
     controller = star_controller()
     parser = argparse.ArgumentParser(description="StarScheduler Application")
