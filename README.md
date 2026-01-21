@@ -19,7 +19,7 @@ StarScheduler is a comprehensive control and scheduling application designed for
 
 ## Requirements
 
-*   Python 3.14 recommended. Some patching required for older versions.
+*   Python 3.8+ minimum, Python 3.13+ recommended. Some patching required for older versions.
 *   See `requirements.txt` for python packages.
 
 **Note on Paramiko**: If using IntelliStar 1 (i1) systems, `paramiko` version must be <= 3.5.1 due to compatibility issues with newer cryptographic defaults.

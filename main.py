@@ -1002,9 +1002,19 @@ class ClientCard(QtWidgets.QFrame):
     def update_status(self):
         isOnline = False
         ping_time = None
-        if connected_outputs_data:
+        client_id = self.client.get('id')
+
+        registry = provision.get_connection_registry()
+        if registry and client_id:
+            isOnline = registry.is_client_connected(client_id)
+            if isOnline:
+                session_info = registry.get_session(client_id)
+                if session_info:
+                    ping_time = datetime.fromtimestamp(session_info.last_activity).strftime("%H:%M:%S")
+
+        if not registry and connected_outputs_data:
              for co in connected_outputs_data:
-                 if co['hostname'] == self.hostname:
+                 if co.get('hostname') == self.hostname or co.get('id') == client_id:
                      isOnline = True
                      ping_time = co.get('last_ping')
                      break
@@ -1554,25 +1564,21 @@ class QuickTimeEventTab(QtWidgets.QWidget):
         self.form.labelForField(self.client_select_widget).setVisible(False)
 
     def _execute(self):
-        cat = self.category_combo.currentText()
-        is_cue = (cat == "Cue Presentation")
+        cat = "Cue Presentation"
         
         client_configs = {}
         target_clients = [] 
         
-        if is_cue:
-             for card in self.card_widgets:
-                 c_data = card.get_data()
-                 cid = c_data.get('client_id')
-                 if cid:
-                     client_configs[cid] = c_data
-                     target_clients.append(cid)
-        else:
-            for i in range(self.client_list.count()):
-                item = self.client_list.item(i)
-                if item.checkState() == QtCore.Qt.CheckState.Checked:
-                    cid = item.data(QtCore.Qt.ItemDataRole.UserRole)
-                    target_clients.append(cid)
+        for card in self.card_widgets:
+            c_data = card.get_data()
+            cid = c_data.get('client_id')
+            if cid:
+                client_configs[cid] = c_data
+                target_clients.append(cid)
+        
+        if not target_clients:
+            logger.warning("No clients selected for Quick Time Event execution")
+            return
         
         target_id = self.target_id_edit.text()
         custom_cmd = self.custom_cmd_edit.text()

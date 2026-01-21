@@ -26,14 +26,11 @@ def _get_optimal_thread_count(max_threads: int = 16) -> int:
     """
     try:
         cpu_count = os.cpu_count() or 2
-        # For I/O-bound subprocess work, use fewer threads than cores
-        # to avoid context-switching overhead
         optimal = min(cpu_count, max_threads, 8)
-        return max(2, optimal)  # Minimum 2 threads
+        return max(2, optimal)
     except Exception:
-        return 4  # Safe fallback
+        return 4
 
-# Lazy-initialized executor - created on first use with dynamic worker count
 _executor: Optional[ThreadPoolExecutor] = None
 _executor_max_workers: int = 16
 
@@ -54,33 +51,26 @@ def configure_executor(max_threads: int = 16) -> None:
     global _executor_max_workers, _executor
     _executor_max_workers = max_threads
     if _executor is not None:
-        # Shutdown old executor and recreate
         _executor.shutdown(wait=False)
         _executor = None
-        _get_executor()  # Recreate with new settings
-
-
-# =============================================================================
-# Persistent Connection Registry
-# =============================================================================
+        _get_executor()
 
 def generate_session_uuid() -> str:
     """Generate a 16-character hex UUID for session identification."""
     return uuid.uuid4().hex[:16]
-
 
 @dataclass
 class SessionInfo:
     """Holds metadata about a persistent session."""
     session_uuid: str
     client_id: str
-    protocol: str  # 'ssh', 'telnet', 'subprocess'
+    protocol: str
     credentials: Dict[str, Any]
     connected: bool = False
     last_activity: float = field(default_factory=time.time)
     error_count: int = 0
-    connection: Any = None  # The actual connection object
-    shell: Any = None  # For SSH interactive shell
+    connection: Any = None
+    shell: Any = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -115,20 +105,14 @@ class PersistentSSHSession:
                     allow_agent=False,
                     banner_timeout=15
                 )
-                
-                # Open interactive shell for su-based commands
                 self.shell = self.client.invoke_shell()
                 time.sleep(0.5)
-                # Drain initial banner
                 while self.shell.recv_ready():
                     self.shell.recv(4096)
-                
-                # If su is configured, switch user now
                 su_user = creds.get('su')
                 if su_user:
                     self.shell.send(f"su -l {su_user}\n".encode())
                     time.sleep(0.8)
-                    # Wait for prompt
                     su_output = ""
                     start = time.time()
                     while time.time() - start < 3:
@@ -172,19 +156,17 @@ class PersistentSSHSession:
                 self.info.last_activity = time.time()
                 
                 if use_shell and self.shell:
-                    # Use interactive shell (for su-based commands)
                     cmd_bytes = (command + "\n").encode("utf-8", errors="replace")
                     self.shell.send(cmd_bytes)
                     
                     output = ""
                     start = time.time()
-                    # Wait for command echo and output
                     time.sleep(0.2)
                     while (time.time() - start) < timeout:
                         if self.shell.recv_ready():
                             data = self.shell.recv(4096).decode('utf-8', errors='replace')
                             output += data
-                            start = time.time()  # Reset timeout on data
+                            start = time.time()
                         else:
                             time.sleep(0.1)
                             if output and (time.time() - start) > 1.5:
@@ -192,7 +174,6 @@ class PersistentSSHSession:
                     
                     return output, ""
                 else:
-                    # Use exec_command for simple commands
                     stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
                     stdout.channel.recv_exit_status()
                     stdout_str = stdout.read().decode('utf-8', errors='replace')
@@ -237,7 +218,6 @@ class PersistentTelnetSession:
         async with self._lock:
             if self._connected and self.writer:
                 return True
-            
             try:
                 creds = self.info.credentials
                 hostname = creds.get('hostname')
@@ -247,11 +227,8 @@ class PersistentTelnetSession:
                     telnetlib3.open_connection(hostname, port),
                     timeout=10.0
                 )
-                
-                # Handle login if credentials provided
                 user = creds.get('user')
                 password = creds.get('password')
-                
                 if user or password:
                     buff = ""
                     start = time.time()
@@ -272,14 +249,12 @@ class PersistentTelnetSession:
                                 break
                         except asyncio.TimeoutError:
                             continue
-                
-                # Handle su if needed
+
                 su_user = creds.get('su')
                 if su_user:
                     await asyncio.sleep(0.5)
                     self.writer.write(f"su -l {su_user}\r\n")
                     await asyncio.sleep(1.0)
-                    # Drain su output
                     try:
                         await asyncio.wait_for(self.reader.read(4096), timeout=1.0)
                     except asyncio.TimeoutError:
@@ -371,16 +346,14 @@ class ConnectionRegistry:
         return cls._instance
     
     def __init__(self):
-        self._sessions: Dict[str, SessionInfo] = {}  # client_id -> SessionInfo
-        self._uuid_map: Dict[str, str] = {}  # session_uuid -> client_id
+        self._sessions: Dict[str, SessionInfo] = {}
+        self._uuid_map: Dict[str, str] = {}
         self._ssh_sessions: Dict[str, PersistentSSHSession] = {}
         self._telnet_sessions: Dict[str, PersistentTelnetSession] = {}
         self._registry_lock = threading.Lock()
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._running = False
         self._async_loop: Optional[asyncio.AbstractEventLoop] = None
-        
-        # Register cleanup at exit
         atexit.register(self.shutdown)
     
     def start(self, clients: list, async_loop: Optional[asyncio.AbstractEventLoop] = None):
@@ -411,12 +384,9 @@ class ConnectionRegistry:
             with self._registry_lock:
                 self._sessions[client_id] = session_info
                 self._uuid_map[session_uuid] = client_id
-            
-            # Create protocol-specific session wrapper
             if protocol == 'ssh':
                 ssh_session = PersistentSSHSession(session_info)
                 self._ssh_sessions[client_id] = ssh_session
-                # Connect in background thread
                 threading.Thread(
                     target=ssh_session.connect,
                     daemon=True,
@@ -426,13 +396,10 @@ class ConnectionRegistry:
             elif protocol == 'telnet':
                 telnet_session = PersistentTelnetSession(session_info)
                 self._telnet_sessions[client_id] = telnet_session
-                # Connect via async loop if available
                 if self._async_loop:
                     asyncio.run_coroutine_threadsafe(telnet_session.connect(), self._async_loop)
             
             logger.debug(f"Registered session {session_uuid} for client {client_id} ({protocol})")
-        
-        # Start heartbeat thread
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
             daemon=True,
@@ -445,7 +412,7 @@ class ConnectionRegistry:
     def _heartbeat_loop(self):
         """Periodically check and reconnect dead connections using absolute wall-clock timing."""
         from datetime import datetime, timedelta
-        heartbeat_interval = timedelta(seconds=30)
+        heartbeat_interval = timedelta(seconds=5)
         next_heartbeat = datetime.now() + heartbeat_interval
         
         while self._running:
@@ -467,11 +434,9 @@ class ConnectionRegistry:
                             if not telnet_sess.is_alive() and self._async_loop:
                                 logger.debug(f"Heartbeat: Reconnecting Telnet session {client_id}")
                                 asyncio.run_coroutine_threadsafe(telnet_sess.connect(), self._async_loop)
-                
-                # Schedule next heartbeat at absolute wall-clock time
+
                 next_heartbeat = datetime.now() + heartbeat_interval
-            
-            # Sleep until next check
+
             sleep_delta = (next_heartbeat - datetime.now()).total_seconds()
             time.sleep(max(0.1, min(sleep_delta, 1.0)))
             
@@ -520,36 +485,56 @@ class ConnectionRegistry:
         status = []
         with self._registry_lock:
             for client_id, info in self._sessions.items():
+                is_connected = False
+                if info.protocol == 'ssh' and client_id in self._ssh_sessions:
+                    is_connected = self._ssh_sessions[client_id].is_alive()
+                elif info.protocol == 'telnet' and client_id in self._telnet_sessions:
+                    is_connected = self._telnet_sessions[client_id].is_alive()
+                elif info.protocol in ('subprocess', 'udp'):
+                    is_connected = True
+                
                 status.append({
                     'client_id': client_id,
                     'session_uuid': info.session_uuid,
                     'protocol': info.protocol,
-                    'connected': info.connected,
+                    'connected': is_connected,
                     'error_count': info.error_count,
                     'last_activity': info.last_activity
                 })
         return status
+    
+    def is_client_connected(self, client_id: str) -> bool:
+        """Check if a specific client has an active connection."""
+        with self._registry_lock:
+            session_info = self._sessions.get(client_id)
+            if not session_info:
+                return False
+            
+            if session_info.protocol == 'ssh' and client_id in self._ssh_sessions:
+                return self._ssh_sessions[client_id].is_alive()
+            elif session_info.protocol == 'telnet' and client_id in self._telnet_sessions:
+                return self._telnet_sessions[client_id].is_alive()
+            elif session_info.protocol in ('subprocess', 'udp'):
+                return True
+        return False
     
     def shutdown(self):
         """Close all connections and cleanup."""
         logger.info("ConnectionRegistry: Shutting down all persistent connections...")
         self._running = False
         
-        # Close SSH sessions
         for client_id, ssh_sess in self._ssh_sessions.items():
             try:
                 ssh_sess.close()
                 logger.debug(f"Closed SSH session: {client_id}")
             except Exception as e:
                 logger.debug(f"Error closing SSH session {client_id}: {e}")
-        
-        # Close Telnet sessions  
+
         for client_id, telnet_sess in self._telnet_sessions.items():
             try:
                 if self._async_loop and self._async_loop.is_running():
                     asyncio.run_coroutine_threadsafe(telnet_sess.close(), self._async_loop)
                 else:
-                    # Try to run sync
                     try:
                         asyncio.get_event_loop().run_until_complete(telnet_sess.close())
                     except:
@@ -565,16 +550,9 @@ class ConnectionRegistry:
         
         logger.info("ConnectionRegistry: Shutdown complete")
 
-
-# Global registry accessor
 def get_connection_registry() -> ConnectionRegistry:
     """Get the global connection registry instance."""
     return ConnectionRegistry.get_instance()
-
-
-# =============================================================================
-# Persistent Session Command Execution Helpers
-# =============================================================================
 
 async def execute_ssh_persistent(client_id: str, command: str, timeout: float = 10.0, use_shell: bool = True) -> Tuple[str, str]:
     """Execute SSH command on persistent session (async wrapper for sync call)."""
@@ -614,7 +592,6 @@ async def execute_local_command(command: str, timeout: float = 10.0) -> tuple[st
             }
             
             if sys.platform == 'win32':
-                # CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS | IDLE_PRIORITY_CLASS
                 kwargs['creationflags'] = 0x08000000 | 0x00004000
             if dangerous_commands.search(command):
                 logger.error(f"Attention! Dangerous command detected in local execution: {command}. Exiting...")
@@ -687,22 +664,18 @@ async def execute_ssh_command(hostname: str, user: str, password: str, port: int
             
             if su:
                 shell = ssh_client.invoke_shell()
-                # Wait for initial shell prompt
                 time.sleep(0.3)
                 while shell.recv_ready():
                     shell.recv(4096)
                 
-                # Send su command
                 shell.send(f"su -l {su}\n".encode())
-                
-                # Wait for su to complete and shell to be ready
+
                 su_wait_start = time.time()
                 su_output = ""
                 while time.time() - su_wait_start < 3:
                     if shell.recv_ready():
                         data = shell.recv(4096).decode('utf-8', errors='replace')
                         su_output += data
-                        # Look for shell prompt indicators
                         if '$' in data or '#' in data or '>' in data:
                             break
                     time.sleep(0.1)
@@ -946,7 +919,6 @@ async def udp_cancel_i2_pres(
     await execute_udp_message(hostname=hostname, port=port, message=command)
     logger.info(f"UDP: Canceled presentation {PresentationId}.")
 
-# Aliases for consistent naming
 execute_udp_cancel_i2_pres = udp_cancel_i2_pres
 
 async def telnet_load_i2_pres(
