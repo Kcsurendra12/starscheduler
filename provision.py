@@ -9,8 +9,12 @@ import time
 import socket
 import telnetlib3
 import subprocess
-from typing import Optional
+import uuid
+import threading
+import atexit
+from typing import Optional, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 
 logger = logging.getLogger("starscheduler.provision")
 
@@ -54,6 +58,540 @@ def configure_executor(max_threads: int = 16) -> None:
         _executor.shutdown(wait=False)
         _executor = None
         _get_executor()  # Recreate with new settings
+
+
+# =============================================================================
+# Persistent Connection Registry
+# =============================================================================
+
+def generate_session_uuid() -> str:
+    """Generate a 16-character hex UUID for session identification."""
+    return uuid.uuid4().hex[:16]
+
+
+@dataclass
+class SessionInfo:
+    """Holds metadata about a persistent session."""
+    session_uuid: str
+    client_id: str
+    protocol: str  # 'ssh', 'telnet', 'subprocess'
+    credentials: Dict[str, Any]
+    connected: bool = False
+    last_activity: float = field(default_factory=time.time)
+    error_count: int = 0
+    connection: Any = None  # The actual connection object
+    shell: Any = None  # For SSH interactive shell
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+class PersistentSSHSession:
+    """Wrapper for persistent SSH connection with interactive shell."""
+    
+    def __init__(self, session_info: SessionInfo):
+        self.info = session_info
+        self.client: Optional[paramiko.SSHClient] = None
+        self.shell = None
+        self._lock = threading.Lock()
+        self._connected = False
+        
+    def connect(self) -> bool:
+        """Establish SSH connection and open interactive shell."""
+        with self._lock:
+            if self._connected and self.client and self.client.get_transport():
+                if self.client.get_transport().is_active():
+                    return True
+            
+            try:
+                creds = self.info.credentials
+                self.client = paramiko.SSHClient()
+                self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                self.client.connect(
+                    hostname=creds.get('hostname'),
+                    port=creds.get('port', 22),
+                    username=creds.get('user'),
+                    password=creds.get('password'),
+                    timeout=15,
+                    look_for_keys=False,
+                    allow_agent=False,
+                    banner_timeout=15
+                )
+                
+                # Open interactive shell for su-based commands
+                self.shell = self.client.invoke_shell()
+                time.sleep(0.5)
+                # Drain initial banner
+                while self.shell.recv_ready():
+                    self.shell.recv(4096)
+                
+                # If su is configured, switch user now
+                su_user = creds.get('su')
+                if su_user:
+                    self.shell.send(f"su -l {su_user}\n".encode())
+                    time.sleep(0.8)
+                    # Wait for prompt
+                    su_output = ""
+                    start = time.time()
+                    while time.time() - start < 3:
+                        if self.shell.recv_ready():
+                            data = self.shell.recv(4096).decode('utf-8', errors='replace')
+                            su_output += data
+                            if '$' in data or '#' in data or '>' in data:
+                                break
+                        time.sleep(0.1)
+                    logger.debug(f"SSH persistent session su output: {su_output[:200]}")
+                
+                self._connected = True
+                self.info.connected = True
+                self.info.last_activity = time.time()
+                self.info.error_count = 0
+                logger.info(f"SSH persistent session established: {self.info.session_uuid} -> {creds.get('hostname')}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"SSH persistent connect failed for {self.info.client_id}: {e}")
+                self.info.error_count += 1
+                self._connected = False
+                self.info.connected = False
+                return False
+    
+    def is_alive(self) -> bool:
+        """Check if connection is still alive."""
+        if not self.client:
+            return False
+        transport = self.client.get_transport()
+        return transport is not None and transport.is_active()
+    
+    def execute(self, command: str, timeout: float = 10.0, use_shell: bool = True) -> Tuple[str, str]:
+        """Execute command on persistent session."""
+        with self._lock:
+            if not self.is_alive():
+                if not self.connect():
+                    return "", "Session disconnected and reconnect failed"
+            
+            try:
+                self.info.last_activity = time.time()
+                
+                if use_shell and self.shell:
+                    # Use interactive shell (for su-based commands)
+                    cmd_bytes = (command + "\n").encode("utf-8", errors="replace")
+                    self.shell.send(cmd_bytes)
+                    
+                    output = ""
+                    start = time.time()
+                    # Wait for command echo and output
+                    time.sleep(0.2)
+                    while (time.time() - start) < timeout:
+                        if self.shell.recv_ready():
+                            data = self.shell.recv(4096).decode('utf-8', errors='replace')
+                            output += data
+                            start = time.time()  # Reset timeout on data
+                        else:
+                            time.sleep(0.1)
+                            if output and (time.time() - start) > 1.5:
+                                break
+                    
+                    return output, ""
+                else:
+                    # Use exec_command for simple commands
+                    stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
+                    stdout.channel.recv_exit_status()
+                    stdout_str = stdout.read().decode('utf-8', errors='replace')
+                    stderr_str = stderr.read().decode('utf-8', errors='replace')
+                    return stdout_str, stderr_str
+                    
+            except Exception as e:
+                logger.error(f"SSH persistent execute error: {e}")
+                self.info.error_count += 1
+                self._connected = False
+                self.info.connected = False
+                return "", str(e)
+    
+    def close(self):
+        """Close the persistent connection."""
+        with self._lock:
+            try:
+                if self.shell:
+                    self.shell.close()
+                if self.client:
+                    self.client.close()
+            except Exception as e:
+                logger.debug(f"Error closing SSH session: {e}")
+            finally:
+                self._connected = False
+                self.info.connected = False
+
+
+class PersistentTelnetSession:
+    """Wrapper for persistent Telnet connection."""
+    
+    def __init__(self, session_info: SessionInfo):
+        self.info = session_info
+        self.reader = None
+        self.writer = None
+        self._lock = asyncio.Lock()
+        self._connected = False
+        self._loop = None
+        
+    async def connect(self) -> bool:
+        """Establish Telnet connection."""
+        async with self._lock:
+            if self._connected and self.writer:
+                return True
+            
+            try:
+                creds = self.info.credentials
+                hostname = creds.get('hostname')
+                port = creds.get('port', 23)
+                
+                self.reader, self.writer = await asyncio.wait_for(
+                    telnetlib3.open_connection(hostname, port),
+                    timeout=10.0
+                )
+                
+                # Handle login if credentials provided
+                user = creds.get('user')
+                password = creds.get('password')
+                
+                if user or password:
+                    buff = ""
+                    start = time.time()
+                    while (time.time() - start) < 5.0:
+                        try:
+                            chunk = await asyncio.wait_for(self.reader.read(1024), timeout=0.5)
+                            if not chunk:
+                                break
+                            buff += chunk.lower()
+                            if "login:" in buff or "name:" in buff:
+                                if user:
+                                    self.writer.write(user + "\r\n")
+                                    buff = ""
+                                    start = time.time()
+                            if "word:" in buff:
+                                if password:
+                                    self.writer.write(password + "\r\n")
+                                break
+                        except asyncio.TimeoutError:
+                            continue
+                
+                # Handle su if needed
+                su_user = creds.get('su')
+                if su_user:
+                    await asyncio.sleep(0.5)
+                    self.writer.write(f"su -l {su_user}\r\n")
+                    await asyncio.sleep(1.0)
+                    # Drain su output
+                    try:
+                        await asyncio.wait_for(self.reader.read(4096), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        pass
+                
+                self._connected = True
+                self.info.connected = True
+                self.info.last_activity = time.time()
+                self.info.error_count = 0
+                self._loop = asyncio.get_event_loop()
+                logger.info(f"Telnet persistent session established: {self.info.session_uuid} -> {hostname}:{port}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Telnet persistent connect failed for {self.info.client_id}: {e}")
+                self.info.error_count += 1
+                self._connected = False
+                self.info.connected = False
+                return False
+    
+    def is_alive(self) -> bool:
+        """Check if connection is still alive."""
+        return self._connected and self.writer is not None
+    
+    async def execute(self, command: str, timeout: float = 10.0) -> Tuple[str, str]:
+        """Execute command on persistent session."""
+        async with self._lock:
+            if not self.is_alive():
+                if not await self.connect():
+                    return "", "Session disconnected and reconnect failed"
+            
+            try:
+                self.info.last_activity = time.time()
+                
+                self.writer.write(command + "\r\n")
+                
+                output = ""
+                start = time.time()
+                while (time.time() - start) < timeout:
+                    try:
+                        data = await asyncio.wait_for(self.reader.read(4096), timeout=0.3)
+                        if not data:
+                            break
+                        output += data
+                    except asyncio.TimeoutError:
+                        if output and (time.time() - start) > 2.0:
+                            break
+                        continue
+                
+                return output, ""
+                
+            except Exception as e:
+                logger.error(f"Telnet persistent execute error: {e}")
+                self.info.error_count += 1
+                self._connected = False
+                self.info.connected = False
+                return "", str(e)
+    
+    async def close(self):
+        """Close the persistent connection."""
+        async with self._lock:
+            try:
+                if self.writer:
+                    self.writer.close()
+                    await self.writer.wait_closed()
+            except Exception as e:
+                logger.debug(f"Error closing Telnet session: {e}")
+            finally:
+                self._connected = False
+                self.info.connected = False
+
+
+class ConnectionRegistry:
+    """
+    Central registry for all persistent connections.
+    Maps client_id -> SessionInfo with UUID tracking.
+    """
+    
+    _instance: Optional['ConnectionRegistry'] = None
+    _lock = threading.Lock()
+    
+    @classmethod
+    def get_instance(cls) -> 'ConnectionRegistry':
+        """Get or create singleton instance."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = ConnectionRegistry()
+        return cls._instance
+    
+    def __init__(self):
+        self._sessions: Dict[str, SessionInfo] = {}  # client_id -> SessionInfo
+        self._uuid_map: Dict[str, str] = {}  # session_uuid -> client_id
+        self._ssh_sessions: Dict[str, PersistentSSHSession] = {}
+        self._telnet_sessions: Dict[str, PersistentTelnetSession] = {}
+        self._registry_lock = threading.Lock()
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._running = False
+        self._async_loop: Optional[asyncio.AbstractEventLoop] = None
+        
+        # Register cleanup at exit
+        atexit.register(self.shutdown)
+    
+    def start(self, clients: list, async_loop: Optional[asyncio.AbstractEventLoop] = None):
+        """Initialize connections for all configured clients."""
+        self._running = True
+        self._async_loop = async_loop
+        
+        logger.info(f"ConnectionRegistry: Initializing {len(clients)} client connections...")
+        
+        for client in clients:
+            client_id = client.get('id', '')
+            protocol = client.get('protocol', 'ssh')
+            creds = client.get('credentials', {})
+            
+            if not client_id:
+                continue
+            
+            session_uuid = generate_session_uuid()
+            
+            session_info = SessionInfo(
+                session_uuid=session_uuid,
+                client_id=client_id,
+                protocol=protocol,
+                credentials=creds,
+                connected=False
+            )
+            
+            with self._registry_lock:
+                self._sessions[client_id] = session_info
+                self._uuid_map[session_uuid] = client_id
+            
+            # Create protocol-specific session wrapper
+            if protocol == 'ssh':
+                ssh_session = PersistentSSHSession(session_info)
+                self._ssh_sessions[client_id] = ssh_session
+                # Connect in background thread
+                threading.Thread(
+                    target=ssh_session.connect,
+                    daemon=True,
+                    name=f"SSHConnect-{client_id}"
+                ).start()
+                
+            elif protocol == 'telnet':
+                telnet_session = PersistentTelnetSession(session_info)
+                self._telnet_sessions[client_id] = telnet_session
+                # Connect via async loop if available
+                if self._async_loop:
+                    asyncio.run_coroutine_threadsafe(telnet_session.connect(), self._async_loop)
+            
+            logger.debug(f"Registered session {session_uuid} for client {client_id} ({protocol})")
+        
+        # Start heartbeat thread
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            daemon=True,
+            name="ConnectionHeartbeat"
+        )
+        self._heartbeat_thread.start()
+        
+        logger.info(f"ConnectionRegistry: Started with {len(self._sessions)} sessions")
+    
+    def _heartbeat_loop(self):
+        """Periodically check and reconnect dead connections using absolute wall-clock timing."""
+        from datetime import datetime, timedelta
+        heartbeat_interval = timedelta(seconds=30)
+        next_heartbeat = datetime.now() + heartbeat_interval
+        
+        while self._running:
+            now = datetime.now()
+            if now >= next_heartbeat:
+                with self._registry_lock:
+                    for client_id, session_info in self._sessions.items():
+                        if session_info.protocol == 'ssh' and client_id in self._ssh_sessions:
+                            ssh_sess = self._ssh_sessions[client_id]
+                            if not ssh_sess.is_alive():
+                                logger.debug(f"Heartbeat: Reconnecting SSH session {client_id}")
+                                threading.Thread(
+                                    target=ssh_sess.connect,
+                                    daemon=True
+                                ).start()
+                        
+                        elif session_info.protocol == 'telnet' and client_id in self._telnet_sessions:
+                            telnet_sess = self._telnet_sessions[client_id]
+                            if not telnet_sess.is_alive() and self._async_loop:
+                                logger.debug(f"Heartbeat: Reconnecting Telnet session {client_id}")
+                                asyncio.run_coroutine_threadsafe(telnet_sess.connect(), self._async_loop)
+                
+                # Schedule next heartbeat at absolute wall-clock time
+                next_heartbeat = datetime.now() + heartbeat_interval
+            
+            # Sleep until next check
+            sleep_delta = (next_heartbeat - datetime.now()).total_seconds()
+            time.sleep(max(0.1, min(sleep_delta, 1.0)))
+            
+            if not self._running:
+                break
+    
+    def get_session(self, client_id: str) -> Optional[SessionInfo]:
+        """Get session info by client ID."""
+        with self._registry_lock:
+            return self._sessions.get(client_id)
+    
+    def get_session_by_uuid(self, session_uuid: str) -> Optional[SessionInfo]:
+        """Get session info by UUID."""
+        with self._registry_lock:
+            client_id = self._uuid_map.get(session_uuid)
+            if client_id:
+                return self._sessions.get(client_id)
+        return None
+    
+    def get_ssh_session(self, client_id: str) -> Optional[PersistentSSHSession]:
+        """Get SSH session wrapper by client ID."""
+        return self._ssh_sessions.get(client_id)
+    
+    def get_telnet_session(self, client_id: str) -> Optional[PersistentTelnetSession]:
+        """Get Telnet session wrapper by client ID."""
+        return self._telnet_sessions.get(client_id)
+    
+    def execute_ssh(self, client_id: str, command: str, timeout: float = 10.0, use_shell: bool = True) -> Tuple[str, str]:
+        """Execute command on persistent SSH session."""
+        ssh_sess = self.get_ssh_session(client_id)
+        if not ssh_sess:
+            logger.warning(f"No SSH session found for client {client_id}, falling back to one-shot")
+            return "", f"No persistent session for {client_id}"
+        return ssh_sess.execute(command, timeout, use_shell)
+    
+    async def execute_telnet(self, client_id: str, command: str, timeout: float = 10.0) -> Tuple[str, str]:
+        """Execute command on persistent Telnet session."""
+        telnet_sess = self.get_telnet_session(client_id)
+        if not telnet_sess:
+            logger.warning(f"No Telnet session found for client {client_id}, falling back to one-shot")
+            return "", f"No persistent session for {client_id}"
+        return await telnet_sess.execute(command, timeout)
+    
+    def get_all_sessions_status(self) -> list:
+        """Get status of all registered sessions."""
+        status = []
+        with self._registry_lock:
+            for client_id, info in self._sessions.items():
+                status.append({
+                    'client_id': client_id,
+                    'session_uuid': info.session_uuid,
+                    'protocol': info.protocol,
+                    'connected': info.connected,
+                    'error_count': info.error_count,
+                    'last_activity': info.last_activity
+                })
+        return status
+    
+    def shutdown(self):
+        """Close all connections and cleanup."""
+        logger.info("ConnectionRegistry: Shutting down all persistent connections...")
+        self._running = False
+        
+        # Close SSH sessions
+        for client_id, ssh_sess in self._ssh_sessions.items():
+            try:
+                ssh_sess.close()
+                logger.debug(f"Closed SSH session: {client_id}")
+            except Exception as e:
+                logger.debug(f"Error closing SSH session {client_id}: {e}")
+        
+        # Close Telnet sessions  
+        for client_id, telnet_sess in self._telnet_sessions.items():
+            try:
+                if self._async_loop and self._async_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(telnet_sess.close(), self._async_loop)
+                else:
+                    # Try to run sync
+                    try:
+                        asyncio.get_event_loop().run_until_complete(telnet_sess.close())
+                    except:
+                        pass
+                logger.debug(f"Closed Telnet session: {client_id}")
+            except Exception as e:
+                logger.debug(f"Error closing Telnet session {client_id}: {e}")
+        
+        self._sessions.clear()
+        self._uuid_map.clear()
+        self._ssh_sessions.clear()
+        self._telnet_sessions.clear()
+        
+        logger.info("ConnectionRegistry: Shutdown complete")
+
+
+# Global registry accessor
+def get_connection_registry() -> ConnectionRegistry:
+    """Get the global connection registry instance."""
+    return ConnectionRegistry.get_instance()
+
+
+# =============================================================================
+# Persistent Session Command Execution Helpers
+# =============================================================================
+
+async def execute_ssh_persistent(client_id: str, command: str, timeout: float = 10.0, use_shell: bool = True) -> Tuple[str, str]:
+    """Execute SSH command on persistent session (async wrapper for sync call)."""
+    loop = asyncio.get_event_loop()
+    registry = get_connection_registry()
+    
+    def _exec():
+        return registry.execute_ssh(client_id, command, timeout, use_shell)
+    
+    return await loop.run_in_executor(_get_executor(), _exec)
+
+
+async def execute_telnet_persistent(client_id: str, command: str, timeout: float = 10.0) -> Tuple[str, str]:
+    """Execute Telnet command on persistent session."""
+    registry = get_connection_registry()
+    return await registry.execute_telnet(client_id, command, timeout)
+
 
 dangerous_commands = re.compile(
     r'(cleardata|syncstarbundleversions|rm\s+-rf\s+(?:--no-preserve-root\s+)?/|:\(\)\s*\{\s*:\|\s*:\&\s*\}\s*;:)',

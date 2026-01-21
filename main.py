@@ -35,8 +35,7 @@ def get_optimal_thread_count(max_threads: int = 16, scale_factor: float = 1.0) -
 _perf_config = {
     'maxThreads': 16,
     'schedulerPollIntervalMs': 50,
-    'cacheUpdateIntervalSec': 2,
-    'repingIntervalSec': 120
+    'cacheUpdateIntervalSec': 2
 }
 
 def load_performance_config(config: dict) -> None:
@@ -46,8 +45,7 @@ def load_performance_config(config: dict) -> None:
     _perf_config.update({
         'maxThreads': perf.get('maxThreads', 16),
         'schedulerPollIntervalMs': perf.get('schedulerPollIntervalMs', 50),
-        'cacheUpdateIntervalSec': perf.get('cacheUpdateIntervalSec', 2),
-        'repingIntervalSec': perf.get('repingIntervalSec', 120)
+        'cacheUpdateIntervalSec': perf.get('cacheUpdateIntervalSec', 2)
     })
     provision.configure_executor(_perf_config['maxThreads'])
     logger.info(f"Performance config loaded: maxThreads={_perf_config['maxThreads']}, "
@@ -2362,7 +2360,7 @@ class SchedulerTab(QtWidgets.QWidget):
         self.refresh_grid()
         self.update_timer = QtCore.QTimer(self)
         self.update_timer.timeout.connect(self.update_current_time_indicator)
-        self.update_timer.start(500)  # Update every 500ms instead of 1ms to reduce GUI load
+        self.update_timer.start(500)
 
     def _setup_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
@@ -3359,34 +3357,19 @@ class star_controller:
         self.client_manager = ClientManager(self)
         self.client_manager.set_log_callback(self._on_log)
         self.scheduler = None
-        self._reping_running = True
         self.stats = {}
-        self.start_reping()
-
-    def start_reping(self):
-        if self.scheduler and self.scheduler.loop and self.scheduler.loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._reping_loop_async(), self.scheduler.loop)
-        else:
-            self.reping_thread = threading.Thread(target=self._reping_loop_sync, daemon=True, name="RepingThread")
-            self.reping_thread.start()
-    async def _reping_loop_async(self):
-        perf = get_perf_config()
-        interval = perf['repingIntervalSec']
-        while self._reping_running:
-            await asyncio.sleep(interval)
-            try:
-                await self.get_all_output_clients()
-            except Exception as e:
-                logger.error(f"Reping Error: {e}")
-    def _reping_loop_sync(self):
-        perf = get_perf_config()
-        interval = perf['repingIntervalSec']
-        while self._reping_running:
-            time.sleep(interval)
-            try:
-                asyncio.run(self.get_all_output_clients())
-            except Exception as e:
-                logger.error(f"Reping Error: {e}")
+        self.connection_registry = None
+    
+    def init_persistent_connections(self, async_loop=None):
+        """Initialize the persistent connection registry for all clients."""
+        clients = self.get_configured_clients()
+        if not clients:
+            logger.warning("No clients configured for persistent connections")
+            return
+        
+        self.connection_registry = provision.get_connection_registry()
+        self.connection_registry.start(clients, async_loop)
+        logger.info(f"Persistent connections initialized for {len(clients)} clients")
 
     def _on_log(self, client_id, text):
         self.log_proxy.log_received.emit(client_id, text)
@@ -3643,10 +3626,16 @@ class scheduler:
         self.thread.start()
 
     def _cache_loop(self):
-        """Cache update loop with configurable interval."""
+        """Cache update loop with absolute wall-clock timing."""
+        cache_interval = timedelta(seconds=self._cache_interval)
+        next_cache_update = datetime.now() + cache_interval
         while self.running:
-            self._update_cache()
-            time.sleep(self._cache_interval)
+            now = datetime.now()
+            if now >= next_cache_update:
+                self._update_cache()
+                next_cache_update = datetime.now() + cache_interval
+            sleep_delta = (next_cache_update - datetime.now()).total_seconds()
+            time.sleep(max(0.1, min(sleep_delta, 1.0)))
 
     def _update_cache(self):
         try:
@@ -3742,7 +3731,7 @@ class scheduler:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
             self.controller.scheduler = self
-            self.controller.start_reping()
+            self.controller.init_persistent_connections(self.loop)
             self.loop.run_until_complete(self.run_scheduler_loop())
         except Exception as e:
             logger.error(f"Scheduler Async Loop Crashed: {e}")
@@ -3984,28 +3973,25 @@ class scheduler:
             pass
 
     async def run_scheduler_loop(self):
-        """Main scheduler loop with drift-corrected 100ms polling.
-        
-        Uses a single trigger at second 48 (12 seconds before minute boundary) for I2 systems
-        with loadRunPres combo command, and separate load/run for I1 systems.
-        
-        Drift correction: Instead of sleeping for a fixed 100ms, we calculate the time
-        until the next 100ms boundary based on wall clock, preventing cumulative drift.
-        """
         while self.cached_mtime == 0 and self.running:
             await asyncio.sleep(0.1)
         
-        logger.info("Scheduler loop started (100ms drift-corrected polling)")
+        logger.info("Scheduler loop started")
         last_fired_minute = -1
         fired_triggers = set()
-        next_prediction_update = time.monotonic()
-        
-        # Track drift for logging
-        drift_check_time = time.monotonic() + 60.0  # Check drift every 60 seconds
-        expected_iterations = 0
-        actual_iterations = 0
+
+        now = datetime.now()
+        next_prediction_update = now + timedelta(seconds=5)
+        drift_check_interval = timedelta(seconds=60)
+        drift_check_time = now + drift_check_interval
+        drift_period_start = now
+        iterations_this_period = 0
+        expected_per_period = 600
         
         TRIGGER_SECONDS = [48, 58]
+
+        base_ms = (now.microsecond // 100000) * 100000
+        next_target = now.replace(microsecond=base_ms) + timedelta(milliseconds=100)
         
         if not self.startup_event_fired:
             all_events = self.grab_all_events()
@@ -4031,9 +4017,9 @@ class scheduler:
                     fired_triggers.clear()
                     last_fired_minute = current_minute
                     
-                if time.monotonic() > next_prediction_update:
+                if now >= next_prediction_update:
                     self._update_prediction(now)
-                    next_prediction_update = time.monotonic() + 5.0
+                    next_prediction_update = now + timedelta(seconds=5)
                     
                 if self.next_event_dt:
                     diff = self.next_event_dt - now
@@ -4077,23 +4063,22 @@ class scheduler:
                                     logger.info(f"Firing trigger sec={trigger_sec} for: {ev.get('DisplayName')} at {now.strftime('%H:%M:%S.%f')[:-3]}")
                                     asyncio.create_task(self._execute_single_event(ev, t_ctx))
                 
-                actual_iterations += 1
+                iterations_this_period += 1
                 now_after = datetime.now()
-                ms = now_after.microsecond // 1000
-                ms_to_next_boundary = (100 - (ms % 100)) % 100
-                if ms_to_next_boundary == 0:
-                    ms_to_next_boundary = 100
-                sleep_time = ms_to_next_boundary / 1000.0
-                if time.monotonic() > drift_check_time:
-                    expected_iterations += 600
-                    drift_ratio = actual_iterations / expected_iterations if expected_iterations > 0 else 1.0
+                next_target += timedelta(milliseconds=100)
+                while next_target <= now_after:
+                    next_target += timedelta(milliseconds=100)
+                sleep_delta = (next_target - now_after).total_seconds()
+                sleep_time = max(0.001, min(sleep_delta, 0.15))
+                if now_after >= drift_check_time:
+                    elapsed = (now_after - drift_period_start).total_seconds()
+                    expected_iters = int(elapsed * 10)
+                    drift_ratio = iterations_this_period / expected_iters if expected_iters > 0 else 1.0
                     if abs(1.0 - drift_ratio) > 0.05:
-                        logger.warning(f"Scheduler drift detected: {drift_ratio:.3f}x ({actual_iterations}/{expected_iterations} iterations)")
-                        import random
-                        randomlol = random.randint(1, 2)
-                        if randomlol == 2:
-                            logger.warning("when im in a time drift competition and my opponent is intellistar renderd:")
-                    drift_check_time = time.monotonic() + 60.0
+                        logger.warning(f"Scheduler drift detected: {drift_ratio:.3f}x ({iterations_this_period}/{expected_iters} iterations in {elapsed:.1f}s)")
+                    iterations_this_period = 0
+                    drift_period_start = now_after
+                    drift_check_time = now_after + drift_check_interval
                 
                 await asyncio.sleep(sleep_time)
                 
@@ -4290,6 +4275,8 @@ class scheduler:
         is_fuckingSTUPID = (c_star == "rai")
         protocol = client_conf.get("protocol", "ssh")
         creds = client_conf.get("credentials", {})
+        registry = provision.get_connection_registry()
+        use_persistent = registry.get_session(c_id) is not None
         
         if category == 'Custom Command':
             custom_cmd = event.get('CustomCommand', '')
@@ -4305,11 +4292,14 @@ class scheduler:
                     su = creds.get('su', 'dgadmin') if is_i1 else creds.get('su', None)
                     if protocol == 'ssh':
                         self.controller.stats['ssh_last'] = f"Custom Cmd -> {creds.get('hostname')}"
-                        res = await provision.execute_ssh_command(
-                            hostname=creds.get('hostname'), user=creds.get('user'),
-                            password=creds.get('password'), port=creds.get('port', 22),
-                            command=custom_cmd, su=su
-                        )
+                        if use_persistent:
+                            res = await provision.execute_ssh_persistent(c_id, custom_cmd, timeout=10.0, use_shell=bool(su))
+                        else:
+                            res = await provision.execute_ssh_command(
+                                hostname=creds.get('hostname'), user=creds.get('user'),
+                                password=creds.get('password'), port=creds.get('port', 22),
+                                command=custom_cmd, su=su
+                            )
                         self._log_execution_result(c_id, res)
                     elif protocol == 'udp':
                         await provision.execute_udp_message(
@@ -4330,22 +4320,29 @@ class scheduler:
 
         if is_i1 and (raw_flavor and raw_flavor.lower() == 'ldl' or raw_action == "LDL (On/Off)"):
             target_state = int(raw_ldl) if str(raw_ldl).isdigit() else 1
+            ldl_cmd = f'runomni /twc/util/toggleNationalLDL.pyc {target_state}'
             if protocol == "ssh":
-                    self.controller.stats['ssh_last'] = f"i1 LDL Toggle {target_state} -> {creds.get('hostname')}"
+                self.controller.stats['ssh_last'] = f"i1 LDL Toggle {target_state} -> {creds.get('hostname')}"
+                if use_persistent:
+                    res = await provision.execute_ssh_persistent(c_id, ldl_cmd, timeout=10.0, use_shell=True)
+                else:
                     res = await provision.ssh_toggleldl_i1(
                         hostname=creds.get("hostname"), user=creds.get("user"),
                         password=creds.get("password"), port=creds.get("port", 22),
                         state=target_state, su=creds.get("su", "dgadmin")
                     )
-                    self._log_execution_result(c_id, res)
+                self._log_execution_result(c_id, res)
             elif protocol == "telnet":
-                    self.controller.stats['telnet_last'] = f"i1 LDL Toggle {target_state} -> {creds.get('hostname')}"
+                self.controller.stats['telnet_last'] = f"i1 LDL Toggle {target_state} -> {creds.get('hostname')}"
+                if use_persistent:
+                    res = await provision.execute_telnet_persistent(c_id, ldl_cmd, timeout=10.0)
+                else:
                     res = await provision.telnet_toggleldl_i1(
                         hostname=creds.get("hostname"), port=creds.get("port", 23),
                         state=target_state, su=creds.get("su", "dgadmin"),
                         user=creds.get("user"), password=creds.get("password")
                     )
-                    self._log_execution_result(c_id, res)
+                self._log_execution_result(c_id, res)
             return
 
         final_duration = 1950
@@ -4380,78 +4377,117 @@ class scheduler:
         if is_i1:
             su = creds.get('su', 'dgadmin')
             if do_i1_load and do_i1_run:
+                load_cmd = f'runomni /twc/util/load.pyc {final_id} {final_flavor.capitalize()}'
+                run_cmd = f'runomni /twc/util/run.pyc {final_id}'
+                
                 if protocol == "ssh":
                     self.controller.stats['ssh_last'] = f"i1 LoadRun {final_flavor} -> {creds.get('hostname')}"
-                    res = await provision.ssh_loadrun_i1_pres(
-                        hostname=creds.get("hostname"), user=creds.get("user"),
-                        password=creds.get("password"), port=creds.get('port', 22),
-                        flavor=final_flavor, PresentationId=final_id, su=su
-                    )
+                    if use_persistent:
+                        res1 = await provision.execute_ssh_persistent(c_id, load_cmd, timeout=10.0, use_shell=True)
+                        self._log_execution_result(c_id, res1, f"i1 Load {final_flavor}")
+                        await asyncio.sleep(2)
+                        res = await provision.execute_ssh_persistent(c_id, run_cmd, timeout=10.0, use_shell=True)
+                    else:
+                        res = await provision.ssh_loadrun_i1_pres(
+                            hostname=creds.get("hostname"), user=creds.get("user"),
+                            password=creds.get("password"), port=creds.get('port', 22),
+                            flavor=final_flavor, PresentationId=final_id, su=su
+                        )
                     self._log_execution_result(c_id, res)
                 elif protocol == "telnet":
                     self.controller.stats['telnet_last'] = f"i1 LoadRun {final_flavor} -> {creds.get('hostname')}"
-                    res = await provision.telnet_loadrun_i1_pres(
-                        hostname=creds.get("hostname"), port=creds.get("port", 23),
-                        flavor=final_flavor, PresentationId=final_id, su=su,
-                        user=creds.get("user"), password=creds.get("password")
-                    )
+                    if use_persistent:
+                        res1 = await provision.execute_telnet_persistent(c_id, load_cmd, timeout=10.0)
+                        self._log_execution_result(c_id, res1, f"i1 Load {final_flavor}")
+                        await asyncio.sleep(2)
+                        res = await provision.execute_telnet_persistent(c_id, run_cmd, timeout=10.0)
+                    else:
+                        res = await provision.telnet_loadrun_i1_pres(
+                            hostname=creds.get("hostname"), port=creds.get("port", 23),
+                            flavor=final_flavor, PresentationId=final_id, su=su,
+                            user=creds.get("user"), password=creds.get("password")
+                        )
                     self._log_execution_result(c_id, res)
             else:
                 if do_i1_load:
+                    load_cmd = f'runomni /twc/util/load.pyc {final_id} {final_flavor.capitalize()}'
                     if protocol == "ssh":
                         self.controller.stats['ssh_last'] = f"i1 Load {final_flavor} -> {creds.get('hostname')}"
-                        res = await provision.ssh_load_i1_pres(
-                            hostname=creds.get("hostname"), user=creds.get("user"),
-                            password=creds.get("password"), port=creds.get('port', 22),
-                            flavor=final_flavor, PresentationId=final_id, su=su
-                        )
+                        if use_persistent:
+                            res = await provision.execute_ssh_persistent(c_id, load_cmd, timeout=10.0, use_shell=True)
+                        else:
+                            res = await provision.ssh_load_i1_pres(
+                                hostname=creds.get("hostname"), user=creds.get("user"),
+                                password=creds.get("password"), port=creds.get('port', 22),
+                                flavor=final_flavor, PresentationId=final_id, su=su
+                            )
                         self._log_execution_result(c_id, res)
                     elif protocol == "telnet":
                         self.controller.stats['telnet_last'] = f"i1 Load {final_flavor} -> {creds.get('hostname')}"
-                        res = await provision.telnet_load_i1_pres(
-                            hostname=creds.get("hostname"), port=creds.get("port", 23),
-                            flavor=final_flavor, PresentationId=final_id, su=su,
-                            user=creds.get("user"), password=creds.get("password")
-                        )
+                        if use_persistent:
+                            res = await provision.execute_telnet_persistent(c_id, load_cmd, timeout=10.0)
+                        else:
+                            res = await provision.telnet_load_i1_pres(
+                                hostname=creds.get("hostname"), port=creds.get("port", 23),
+                                flavor=final_flavor, PresentationId=final_id, su=su,
+                                user=creds.get("user"), password=creds.get("password")
+                            )
                         self._log_execution_result(c_id, res)
                 if do_i1_run:
+                    run_cmd = f'runomni /twc/util/run.pyc {final_id}'
                     if protocol == "ssh":
                         self.controller.stats['ssh_last'] = f"i1 Run {final_id} -> {creds.get('hostname')}"
-                        res = await provision.ssh_run_i1_pres(
-                            hostname=creds.get("hostname"), user=creds.get("user"),
-                            password=creds.get("password"), port=creds.get('port', 22),
-                            flavor=final_flavor, PresentationId=final_id, su=su
-                        )
+                        if use_persistent:
+                            res = await provision.execute_ssh_persistent(c_id, run_cmd, timeout=10.0, use_shell=True)
+                        else:
+                            res = await provision.ssh_run_i1_pres(
+                                hostname=creds.get("hostname"), user=creds.get("user"),
+                                password=creds.get("password"), port=creds.get('port', 22),
+                                flavor=final_flavor, PresentationId=final_id, su=su
+                            )
                         self._log_execution_result(c_id, res)
                     elif protocol == "telnet":
                         self.controller.stats['telnet_last'] = f"i1 Run {final_id} -> {creds.get('hostname')}"
-                        res = await provision.telnet_run_i1_pres(
-                            hostname=creds.get("hostname"), port=creds.get("port", 23),
-                            flavor=final_flavor, PresentationId=final_id, su=su,
-                            user=creds.get("user"), password=creds.get("password")
-                        )
+                        if use_persistent:
+                            res = await provision.execute_telnet_persistent(c_id, run_cmd, timeout=10.0)
+                        else:
+                            res = await provision.telnet_run_i1_pres(
+                                hostname=creds.get("hostname"), port=creds.get("port", 23),
+                                flavor=final_flavor, PresentationId=final_id, su=su,
+                                user=creds.get("user"), password=creds.get("password")
+                            )
                         self._log_execution_result(c_id, res)
         else:
             su = creds.get('su', None)
+            i2exec = provision.i2exec
 
             if do_i2_loadrun:
+                loadrun_cmd = f'"{i2exec}" loadRunPres(Flavor="{final_flavor}",Duration="{final_duration}",PresentationId="{final_id}")'
+                
                 if protocol == "ssh":
                     self.controller.stats['ssh_last'] = f"LoadRun {final_id} -> {creds.get('hostname')}"
-                    res = await provision.ssh_loadrun_i2_pres(
-                        hostname=creds.get("hostname"), user=creds.get("user"),
-                        password=creds.get("password"), port=creds.get("port", 22),
-                        flavor=final_flavor, PresentationId=final_id,
-                        duration=final_duration, su=su
-                    )
+                    if use_persistent:
+                        res = await provision.execute_ssh_persistent(c_id, loadrun_cmd, timeout=15.0, use_shell=bool(su))
+                    else:
+                        res = await provision.ssh_loadrun_i2_pres(
+                            hostname=creds.get("hostname"), user=creds.get("user"),
+                            password=creds.get("password"), port=creds.get("port", 22),
+                            flavor=final_flavor, PresentationId=final_id,
+                            duration=final_duration, su=su
+                        )
                     self._log_execution_result(c_id, res)
                 elif protocol == "telnet":
+                    telnet_loadrun_cmd = f'loadRunPres(Flavor="{final_flavor}",Duration="{final_duration}",PresentationId="{final_id}")'
                     self.controller.stats['telnet_last'] = f"LoadRun {final_id} -> {creds.get('hostname')}"
-                    res = await provision.telnet_loadrun_i2_pres(
-                        hostname=creds.get("hostname"), port=creds.get("port", 23),
-                        flavor=final_flavor, PresentationId=final_id,
-                        duration=final_duration,
-                        user=creds.get("user"), password=creds.get("password")
-                    )
+                    if use_persistent:
+                        res = await provision.execute_telnet_persistent(c_id, telnet_loadrun_cmd, timeout=15.0)
+                    else:
+                        res = await provision.telnet_loadrun_i2_pres(
+                            hostname=creds.get("hostname"), port=creds.get("port", 23),
+                            flavor=final_flavor, PresentationId=final_id,
+                            duration=final_duration,
+                            user=creds.get("user"), password=creds.get("password")
+                        )
                     self._log_execution_result(c_id, res)
                 elif protocol == "subprocess":
                     self.controller.stats['sub_last'] = f"LoadRun {final_id}"
