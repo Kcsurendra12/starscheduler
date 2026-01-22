@@ -412,17 +412,27 @@ class ConnectionRegistry:
     def _heartbeat_loop(self):
         """Periodically check and reconnect dead connections using absolute wall-clock timing."""
         from datetime import datetime, timedelta
-        heartbeat_interval = timedelta(seconds=5)
-        next_heartbeat = datetime.now() + heartbeat_interval
+        heartbeat_interval_sec = 5
+        last_heartbeat_second = -1
         
         while self._running:
             now = datetime.now()
-            if now >= next_heartbeat:
+            current_second = now.second
+            aligned_second = (current_second // heartbeat_interval_sec) * heartbeat_interval_sec
+            
+            if aligned_second != last_heartbeat_second and current_second % heartbeat_interval_sec == 0:
+                last_heartbeat_second = aligned_second
+
                 with self._registry_lock:
-                    for client_id, session_info in self._sessions.items():
+                    sessions_snapshot = list(self._sessions.items())
+
+                for client_id, session_info in sessions_snapshot:
+                    try:
                         if session_info.protocol == 'ssh' and client_id in self._ssh_sessions:
                             ssh_sess = self._ssh_sessions[client_id]
-                            if not ssh_sess.is_alive():
+                            is_alive = ssh_sess.is_alive()
+                            session_info.connected = is_alive
+                            if not is_alive:
                                 logger.debug(f"Heartbeat: Reconnecting SSH session {client_id}")
                                 threading.Thread(
                                     target=ssh_sess.connect,
@@ -431,14 +441,27 @@ class ConnectionRegistry:
                         
                         elif session_info.protocol == 'telnet' and client_id in self._telnet_sessions:
                             telnet_sess = self._telnet_sessions[client_id]
-                            if not telnet_sess.is_alive() and self._async_loop:
+                            is_alive = telnet_sess.is_alive()
+                            session_info.connected = is_alive
+                            if not is_alive and self._async_loop:
                                 logger.debug(f"Heartbeat: Reconnecting Telnet session {client_id}")
                                 asyncio.run_coroutine_threadsafe(telnet_sess.connect(), self._async_loop)
+                        
+                        elif session_info.protocol in ('subprocess', 'udp'):
+                            session_info.connected = True
+                    except Exception as e:
+                        logger.debug(f"Heartbeat check error for {client_id}: {e}")
+                        session_info.connected = False
 
-                next_heartbeat = datetime.now() + heartbeat_interval
-
-            sleep_delta = (next_heartbeat - datetime.now()).total_seconds()
-            time.sleep(max(0.1, min(sleep_delta, 1.0)))
+            current_us = now.microsecond
+            next_boundary_us = ((current_us // 500000) + 1) * 500000
+            if next_boundary_us >= 1000000:
+                sleep_us = 1000000 - current_us
+            else:
+                sleep_us = next_boundary_us - current_us
+            
+            sleep_time = max(0.05, min(sleep_us / 1000000.0, 0.55))
+            time.sleep(sleep_time)
             
             if not self._running:
                 break
@@ -481,42 +504,28 @@ class ConnectionRegistry:
         return await telnet_sess.execute(command, timeout)
     
     def get_all_sessions_status(self) -> list:
-        """Get status of all registered sessions."""
+        """Get status of all registered sessions (uses cached status, non-blocking)."""
         status = []
         with self._registry_lock:
-            for client_id, info in self._sessions.items():
-                is_connected = False
-                if info.protocol == 'ssh' and client_id in self._ssh_sessions:
-                    is_connected = self._ssh_sessions[client_id].is_alive()
-                elif info.protocol == 'telnet' and client_id in self._telnet_sessions:
-                    is_connected = self._telnet_sessions[client_id].is_alive()
-                elif info.protocol in ('subprocess', 'udp'):
-                    is_connected = True
-                
-                status.append({
-                    'client_id': client_id,
-                    'session_uuid': info.session_uuid,
-                    'protocol': info.protocol,
-                    'connected': is_connected,
-                    'error_count': info.error_count,
-                    'last_activity': info.last_activity
-                })
+            sessions_snapshot = list(self._sessions.items())
+        
+        for client_id, info in sessions_snapshot:
+            status.append({
+                'client_id': client_id,
+                'session_uuid': info.session_uuid,
+                'protocol': info.protocol,
+                'connected': info.connected,
+                'error_count': info.error_count,
+                'last_activity': info.last_activity
+            })
         return status
     
     def is_client_connected(self, client_id: str) -> bool:
-        """Check if a specific client has an active connection."""
-        with self._registry_lock:
-            session_info = self._sessions.get(client_id)
-            if not session_info:
-                return False
-            
-            if session_info.protocol == 'ssh' and client_id in self._ssh_sessions:
-                return self._ssh_sessions[client_id].is_alive()
-            elif session_info.protocol == 'telnet' and client_id in self._telnet_sessions:
-                return self._telnet_sessions[client_id].is_alive()
-            elif session_info.protocol in ('subprocess', 'udp'):
-                return True
-        return False
+        """Check if a specific client has an active connection (returns cached status, non-blocking)."""
+        session_info = self._sessions.get(client_id)
+        if not session_info:
+            return False
+        return session_info.connected
     
     def shutdown(self):
         """Close all connections and cleanup."""
@@ -1086,4 +1095,3 @@ async def ssh_toggleldl_i1(
     else:
         logger.info(f"SSH: Toggled LDL on IntelliStar to state {state}.")
     return output, stderr
-

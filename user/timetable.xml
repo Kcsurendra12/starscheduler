@@ -124,23 +124,33 @@
         <Enabled>True</Enabled>
         <ClientConfigs>
             <ClientConfig id="i2xd_172_16_1_31">
+                <Action>LoadRun</Action>
                 <Flavor>domestic/V</Flavor>
                 <PresentationID>1</PresentationID>
                 <Duration>75</Duration>
+                <Logo />
+                <Command />
+                <SU />
+                <LDLState />
             </ClientConfig>
-            <ClientConfig id="i2jr_172_16_1_32">
+            <ClientConfig id="i1_172_16_1_39">
+                <Action>LoadRun</Action>
                 <Flavor>domesticsd/V</Flavor>
-                <PresentationID>1</PresentationID>
-                <Duration>65</Duration>
+                <PresentationID />
+                <Duration />
+                <Logo />
+                <Command />
+                <SU />
+                <LDLState />
             </ClientConfig>
         </ClientConfigs>
         <clients>
             <client>i2xd_172_16_1_31</client>
-            <client>i2jr_172_16_1_32</client>
+            <client>i1_172_16_1_39</client>
         </clients>
         <flavor>
             <flavor client="i2xd_172_16_1_31">domestic/V</flavor>
-            <flavor client="i2jr_172_16_1_32">domesticsd/V</flavor>
+            <flavor client="i1_172_16_1_39">domesticsd/V</flavor>
         </flavor>
     </event>
     <event>
@@ -443,7 +453,7 @@
         <Category>Cancel Presentation</Category>
         <TargetID>sidebar1</TargetID>
         <CustomCommand />
-        <MinuteInterval>7</MinuteInterval>
+        <MinuteInterval>8</MinuteInterval>
         <TenMinuteInterval>
             <TenMinute>00</TenMinute>
             <TenMinute>10</TenMinute>
@@ -489,23 +499,6 @@
         <clients>
             <client>i2xd_172_16_1_31</client>
         </clients>
-        <flavor />
-    </event>
-    <event>
-        <DisplayName />
-        <Category>Cue Presentation</Category>
-        <TargetID />
-        <CustomCommand />
-        <MinuteInterval />
-        <TenMinuteInterval />
-        <Hours />
-        <Days />
-        <Weeks />
-        <Months />
-        <RunAtStartup>False</RunAtStartup>
-        <Enabled>True</Enabled>
-        <ClientConfigs />
-        <clients />
         <flavor />
     </event>
 </timetable>

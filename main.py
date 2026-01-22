@@ -2366,7 +2366,7 @@ class SchedulerTab(QtWidgets.QWidget):
         self.refresh_grid()
         self.update_timer = QtCore.QTimer(self)
         self.update_timer.timeout.connect(self.update_current_time_indicator)
-        self.update_timer.start(500)
+        self.update_timer.start(100)
 
     def _setup_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
@@ -3633,15 +3633,28 @@ class scheduler:
 
     def _cache_loop(self):
         """Cache update loop with absolute wall-clock timing."""
-        cache_interval = timedelta(seconds=self._cache_interval)
-        next_cache_update = datetime.now() + cache_interval
+        cache_interval_sec = self._cache_interval
+        last_cache_second = -1
+        
         while self.running:
             now = datetime.now()
-            if now >= next_cache_update:
+            current_second = now.second
+
+            aligned_second = (current_second // cache_interval_sec) * cache_interval_sec
+            
+            if aligned_second != last_cache_second and current_second % cache_interval_sec == 0:
                 self._update_cache()
-                next_cache_update = datetime.now() + cache_interval
-            sleep_delta = (next_cache_update - datetime.now()).total_seconds()
-            time.sleep(max(0.1, min(sleep_delta, 1.0)))
+                last_cache_second = aligned_second
+
+            current_us = now.microsecond
+            next_boundary_us = ((current_us // 500000) + 1) * 500000
+            if next_boundary_us >= 1000000:
+                sleep_us = 1000000 - current_us
+            else:
+                sleep_us = next_boundary_us - current_us
+            
+            sleep_time = max(0.05, min(sleep_us / 1000000.0, 0.55))
+            time.sleep(sleep_time)
 
     def _update_cache(self):
         try:
@@ -3986,18 +3999,16 @@ class scheduler:
         last_fired_minute = -1
         fired_triggers = set()
 
-        now = datetime.now()
-        next_prediction_update = now + timedelta(seconds=5)
         drift_check_interval = timedelta(seconds=60)
-        drift_check_time = now + drift_check_interval
-        drift_period_start = now
+        drift_check_time = datetime.now() + drift_check_interval
+        drift_period_start = datetime.now()
         iterations_this_period = 0
-        expected_per_period = 600
         
-        TRIGGER_SECONDS = [48, 58]
+        TRIGGER_SECONDS = [50, 58]
 
-        base_ms = (now.microsecond // 100000) * 100000
-        next_target = now.replace(microsecond=base_ms) + timedelta(milliseconds=100)
+        next_prediction_second = (datetime.now().second // 5) * 5 + 5
+        if next_prediction_second >= 60:
+            next_prediction_second = 0
         
         if not self.startup_event_fired:
             all_events = self.grab_all_events()
@@ -4017,15 +4028,15 @@ class scheduler:
                 current_hour = now.hour
                 current_minute = now.minute
                 current_second = now.second
+                current_ms = now.microsecond // 1000
                 minute_key = (current_hour, current_minute)
                 
                 if current_minute != last_fired_minute:
                     fired_triggers.clear()
                     last_fired_minute = current_minute
-                    
-                if now >= next_prediction_update:
+
+                if current_second % 5 == 0 and current_ms < 150:
                     self._update_prediction(now)
-                    next_prediction_update = now + timedelta(seconds=5)
                     
                 if self.next_event_dt:
                     diff = self.next_event_dt - now
@@ -4037,7 +4048,7 @@ class scheduler:
                 next_minute = now + timedelta(minutes=1)
                 target_event_time = next_minute.replace(second=0, microsecond=0)
                 self.next_check_time = target_event_time.strftime("%I:%M %p")
-                
+
                 for trigger_sec in TRIGGER_SECONDS:
                     trigger_key = (minute_key, trigger_sec)
 
@@ -4046,8 +4057,9 @@ class scheduler:
                             fired_triggers.add(trigger_key)
 
                             seconds_late = current_second - trigger_sec
-                            if seconds_late > 2:
-                                logger.warning(f"Trigger sec={trigger_sec} is {seconds_late}s late (fired at :{current_second})")
+                            ms_late = (current_second - trigger_sec) * 1000 + current_ms
+                            if ms_late > 500:
+                                logger.warning(f"Trigger sec={trigger_sec} is {ms_late}ms late (fired at :{current_second}.{current_ms:03d})")
                             
                             is_48_trigger = (trigger_sec == 48)
                             is_58_trigger = (trigger_sec == 58)
@@ -4071,17 +4083,21 @@ class scheduler:
                 
                 iterations_this_period += 1
                 now_after = datetime.now()
-                next_target += timedelta(milliseconds=100)
-                while next_target <= now_after:
-                    next_target += timedelta(milliseconds=100)
-                sleep_delta = (next_target - now_after).total_seconds()
-                sleep_time = max(0.001, min(sleep_delta, 0.15))
+                current_us = now_after.microsecond
+                next_boundary_us = ((current_us // 50000) + 1) * 50000
+                if next_boundary_us >= 1000000:
+                    sleep_us = (1000000 - current_us) + 0
+                else:
+                    sleep_us = next_boundary_us - current_us
+                
+                sleep_time = sleep_us / 1000000.0
+                sleep_time = max(0.005, min(sleep_time, 0.055))
                 if now_after >= drift_check_time:
                     elapsed = (now_after - drift_period_start).total_seconds()
-                    expected_iters = int(elapsed * 10)
+                    expected_iters = int(elapsed * 20)
                     drift_ratio = iterations_this_period / expected_iters if expected_iters > 0 else 1.0
-                    if abs(1.0 - drift_ratio) > 0.05:
-                        logger.warning(f"Scheduler drift detected: {drift_ratio:.3f}x ({iterations_this_period}/{expected_iters} iterations in {elapsed:.1f}s)")
+                    if abs(1.0 - drift_ratio) > 0.02:
+                        logger.warning(f"Scheduler drift: {drift_ratio:.3f}x ({iterations_this_period}/{expected_iters} iters in {elapsed:.1f}s)")
                     iterations_this_period = 0
                     drift_period_start = now_after
                     drift_check_time = now_after + drift_check_interval
@@ -4090,7 +4106,7 @@ class scheduler:
                 
             except Exception as e:
                 logger.error(f"Scheduler Loop Error: {e}")
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
 
     def _update_prediction(self, now):
         try:
@@ -4709,5 +4725,4 @@ if __name__ == "__main__":
         exit_code = 1
     finally:
         cleanup_on_exit()
-    
     sys.exit(exit_code)
