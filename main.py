@@ -2269,6 +2269,8 @@ class HomeTab(QtWidgets.QWidget):
                 self.client_cards.append(card)
 
     def update_dashboard(self):
+        if self.scheduler:
+            self.scheduler._update_countdown()
         self.update_tables()
         clients = self.controller.config.get('outputs', [])
         if len(clients) != len(self.client_cards):
@@ -3644,8 +3646,8 @@ class EventSchedulerEngine:
             timezone=local_timezone,
             job_defaults={
                 'coalesce': True,
-                'max_instances': 8,
-                'misfire_grace_time': 6
+                'max_instances': 1,
+                'misfire_grace_time': 30
             }
         )
         self._scheduler.add_listener(
@@ -3657,18 +3659,14 @@ class EventSchedulerEngine:
         self._scheduler.add_job(
             self._check_timetable_changes,
             'interval',
-            seconds=2,
+            seconds=5,
             id='timetable_watcher',
-            replace_existing=True
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=10
         )
-        self._countdown_job_id = 'countdown_updater'
-        self._scheduler.add_job(
-            self._update_countdown,
-            'interval',
-            seconds=1,
-            id=self._countdown_job_id,
-            replace_existing=True
-        )
+        self._countdown_job_id = None
         
         logger.info("APScheduler engine started")
         
@@ -4278,17 +4276,23 @@ class EventSchedulerEngine:
             self.controller.client_manager.log_output(client_id, output)
             
     def _update_countdown(self):
-        if self.next_event_dt:
-            now = datetime.now()
-            next_dt = self.next_event_dt
-            if hasattr(next_dt, 'tzinfo') and next_dt.tzinfo is not None:
-                next_dt = next_dt.replace(tzinfo=None)
-            diff = next_dt - now
-            if diff.total_seconds() > 0:
-                self.next_event_countdown = str(diff).split('.')[0]
+        """Update countdown string. Called by UI timer, not APScheduler."""
+        try:
+            if self.next_event_dt:
+                now = datetime.now()
+                next_dt = self.next_event_dt
+                if hasattr(next_dt, 'tzinfo') and next_dt.tzinfo is not None:
+                    next_dt = next_dt.replace(tzinfo=None)
+                diff = next_dt - now
+                if diff.total_seconds() > 0:
+                    self.next_event_countdown = str(diff).split('.')[0]
+                else:
+                    self.next_event_countdown = "00:00:00"
+                    self._update_next_event()
             else:
                 self.next_event_countdown = "00:00:00"
-                self._update_next_event()
+        except Exception:
+            self.next_event_countdown = "--:--:--"
                 
     def _update_next_event(self):
         if not self._scheduler:
