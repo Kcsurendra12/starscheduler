@@ -2,6 +2,8 @@ import os
 import random
 import sys
 import asyncio
+import uuid
+import hashlib
 from tkinter import font
 import coloredlogs, logging
 import paramiko
@@ -35,6 +37,15 @@ except ImportError:
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+def generate_action_id(data: Dict) -> str:
+    parts = []
+    keys = ['client_id', 'action', 'flavor', 'presentation_id', 'duration', 'logo', 'command', 'su', 'ldl_state']
+    for k in keys:
+        val = str(data.get(k, '')).strip()
+        parts.append(f"{k}:{val}")
+    s = "|".join(parts)
+    return hashlib.md5(s.encode('utf-8')).hexdigest()
 
 def get_optimal_thread_count(max_threads: int = 16, scale_factor: float = 1.0) -> int:
     try:
@@ -133,6 +144,14 @@ dark_stylesheet = """
         color: #ffffff;
         font-family: 'Host Grotesk', sans-serif;
     }
+    QPushButton {
+        background-color: #1c395c;
+        border: 1px solid #87CEEB;
+        color: #e0e0e0;
+        border-radius: 4px;
+        font-size: 12px;
+        }
+    QPushButton:hover { background-color: #143048; }
     QWidget {
         background-color: #1e1e1e;
         color: #ffffff;
@@ -157,13 +176,13 @@ dark_stylesheet = """
             QLineEdit {
                 background-color: #2d2d2d;
                 color: #ffffff;
-                border: 1px solid #404040;
+                border: 2px solid #404040;
                 padding: 5px;
             }
             QPushButton {
                 background-color: #404040;
                 color: #ffffff;
-                border: 1px solid #505050;
+                border: 4px solid #505050;
                 padding: 5px 15px;
                 border-radius: 3px;
             }
@@ -421,36 +440,10 @@ class ClientDialog(QtWidgets.QDialog):
         btn_layout.addStretch()
         self.cancel_btn = QtWidgets.QPushButton("Cancel")
         self.cancel_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.cancel_btn.setStyleSheet("""
-            QPushButton { 
-                background: transparent; 
-                color: #aaa; 
-                border: 1px solid #444; 
-                padding: 6px 16px; 
-                border-radius: 4px; 
-            }
-            QPushButton:hover { 
-                border-color: #666; 
-                color: white; 
-            }
-        """)
         self.cancel_btn.clicked.connect(self.reject)
         
         self.save_btn = QtWidgets.QPushButton("Save Configuration")
         self.save_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.save_btn.setStyleSheet("""
-            QPushButton { 
-                background-color: #0c1d2b;
-                color: white; 
-                border: 1px solid #87CEEB;
-                padding: 6px 20px; 
-                border-radius: 4px; 
-                font-weight: 600; 
-            }
-            QPushButton:hover { 
-                background-color: #143048; 
-            }
-        """)
         self.save_btn.clicked.connect(self.accept)
         
         btn_layout.addWidget(self.cancel_btn)
@@ -615,19 +608,6 @@ class ClientActionCard(QtWidgets.QFrame):
         del_btn = QtWidgets.QPushButton("x")
         del_btn.setFixedSize(20, 20)
         del_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        del_btn.setStyleSheet("""
-            QPushButton { 
-                background: transparent; 
-                color: #666; 
-                border: none;
-                font-weight: light;
-                font-size: 20px;
-                padding-bottom: 2px;
-            }
-            QPushButton:hover { 
-                color: #ff5555; 
-            }
-        """)
         del_btn.setToolTip("Remove Action")
         del_btn.clicked.connect(self.delete_clicked.emit)
         header_layout.addWidget(del_btn)
@@ -835,6 +815,8 @@ class ClientActionCard(QtWidgets.QFrame):
         if not res: return {}
         cid, cfg = res
         cfg['client_id'] = cid
+        if self.config.get('action_guid'):
+            cfg['action_guid'] = self.config.get('action_guid')
         return cfg
 
 class ClientCard(QtWidgets.QFrame):
@@ -956,43 +938,11 @@ class ClientCard(QtWidgets.QFrame):
         self.edit_btn = QtWidgets.QPushButton("Edit")
         self.edit_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.edit_btn.setFixedSize(60, 32)
-        self.edit_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1c395c;
-                border: 1px solid #87CEEB;
-                color: #e0e0e0;
-                border-radius: 4px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #15406e;
-                color: #ffffff;
-            }
-            QPushButton:pressed {
-                background-color: #2b2b2b;
-            }
-        """)
         if self.edit_callback:
             self.edit_btn.clicked.connect(lambda: self.edit_callback(self.client))
         self.del_btn = QtWidgets.QPushButton("x")
         self.del_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.del_btn.setFixedSize(32, 32)
-        self.del_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #3d0a0a;
-                border: 1px solid #ff7777;
-                color: #ff7777;
-                border-radius: 4px;
-                font-size: 22px;
-                color: #ff7777;
-            }
-            QPushButton:hover {
-                background-color: #401818;
-            }
-            QPushButton:pressed {
-                background-color: #5c1010;
-            }
-        """)
 
         if self.delete_callback:
             self.del_btn.clicked.connect(lambda: self.delete_callback(self.client))
@@ -1163,16 +1113,6 @@ class EventDialog(QtWidgets.QDialog):
         self.add_client_btn = QtWidgets.QPushButton("+ Add Client Action")
         self.add_client_btn.clicked.connect(self._add_action_card)
         self.add_client_btn.setFixedHeight(32)
-        self.add_client_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1c395c;
-                border: 1px solid #87CEEB;
-                color: #e0e0e0;
-                border-radius: 4px;
-                font-size: 12px;
-            }
-            QPushButton:hover { background-color: #143048; }
-        """)
         btn_layout.addWidget(self.add_client_btn)
         btn_layout.addStretch()
         mapping_layout.addLayout(btn_layout)
@@ -1321,9 +1261,11 @@ class EventDialog(QtWidgets.QDialog):
         c_configs = self.event_data.get('client_config', {})
         
         if c_configs:
-             for cid, conf in c_configs.items():
+             for key, conf in c_configs.items():
+                 real_cid = conf.get('client_id') or key
                  data = {
-                     'client_id': cid,
+                     'client_id': real_cid,
+                     'action_guid': key,
                      'action': conf.get('action', 'LoadRun'),
                      'flavor': conf.get('flavor', ''),
                      'presentation_id': conf.get('presentation_id', ''),
@@ -1412,9 +1354,13 @@ class EventDialog(QtWidgets.QDialog):
                 c_data = card.get_data()
                 cid = c_data.get('client_id')
                 if not cid: continue
+
+                action_guid = generate_action_id(c_data)
+                c_data['action_guid'] = action_guid
                 
-                client_configs[cid] = c_data
-                client_keys.append(cid)
+                client_configs[action_guid] = c_data
+                if cid not in client_keys:
+                    client_keys.append(cid)
 
                 if c_data.get('flavor'):
                     flavor_map[cid] = c_data['flavor']
@@ -1504,16 +1450,6 @@ class QuickTimeEventTab(QtWidgets.QWidget):
         self.add_client_btn.clicked.connect(lambda: self._add_action_card())
         self.add_client_btn.setFixedHeight(32)
         self.add_client_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.add_client_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1c395c;
-                border: 1px solid #87CEEB;
-                color: #e0e0e0;
-                border-radius: 4px;
-                font-size: 12px;
-            }
-            QPushButton:hover { background-color: #143048; }
-        """)
         btn_layout.addWidget(self.add_client_btn)
         btn_layout.addStretch()
         mapping_layout.addLayout(btn_layout)
@@ -1521,13 +1457,11 @@ class QuickTimeEventTab(QtWidgets.QWidget):
 
         layout.addWidget(form_widget)
         
-        self.exec_btn = QtWidgets.QPushButton("EXECUTE NOW")
-        self.exec_btn.setFixedHeight(50)
-        self.exec_btn.setStyleSheet("background-color: #aa0000; font-weight: bold; font-size: 16px;")
-        self.exec_btn.clicked.connect(self._execute)
+        self.exec_btn = QtWidgets.QPushButton("Execute")
+        self.exec_btn.setFixedHeight(36)
         layout.addWidget(self.exec_btn)
         layout.addStretch()
-        self._add_action_card({'star': 'i2xd', 'flavor': 'domestic/awesomefreakingforecast'})
+        self._add_action_card({'star': 'i2xd', 'flavor': 'domestic/V'})
 
     def _add_action_card(self, initial_data=None):
         if initial_data and 'star' in initial_data and 'client_id' not in initial_data:
@@ -1576,8 +1510,14 @@ class QuickTimeEventTab(QtWidgets.QWidget):
             c_data = card.get_data()
             cid = c_data.get('client_id')
             if cid:
-                client_configs[cid] = c_data
-                target_clients.append(cid)
+                action_guid = c_data.get('action_guid')
+                if not action_guid:
+                    action_guid = generate_action_id(c_data)
+                    c_data['action_guid'] = action_guid
+            
+                client_configs[action_guid] = c_data
+                if cid not in target_clients:
+                    target_clients.append(cid)
         
         if not target_clients:
             logger.warning("No clients selected for Quick Time Event execution")
@@ -1586,26 +1526,31 @@ class QuickTimeEventTab(QtWidgets.QWidget):
         target_id = self.target_id_edit.text()
         custom_cmd = self.custom_cmd_edit.text()
         length = 60
-        if self.controller.scheduler and self.controller.scheduler.loop and self.controller.scheduler.loop.is_running():
-            asyncio.run_coroutine_threadsafe(
-                self._run_batch_logic_async(cat, target_clients, client_configs, target_id, custom_cmd, length),
-                self.controller.scheduler.loop
-            )
-        else:
-            logger.warning("Scheduler loop not running, falling back to threaded execution")
-            t = threading.Thread(target=self._run_batch_logic_sync, args=(cat, target_clients, client_configs, target_id, custom_cmd, length))
-            t.start()
+        t = threading.Thread(
+            target=self._run_batch_logic_sync,
+            args=(cat, target_clients, client_configs, target_id, custom_cmd, length),
+            daemon=True
+        )
+        t.start()
+        
     async def _run_batch_logic_async(self, cat, target_clients, client_configs, target_id, custom_cmd, length):
         clients = self.controller.get_configured_clients()
         logger.info("Executing Quick Time Event batch...")
         
+        client_map = {}
+        for c in clients:
+             if c.get('id'): client_map[c.get('id')] = c
+             if c.get('star'): client_map[c.get('star')] = c
+
         tasks = []
-        for client in clients:
-            cid = client.get('id') or client.get('star')
-            if cid not in target_clients:
+        for key, conf in client_configs.items():
+            cid = conf.get('client_id') or key
+            client = client_map.get(cid)
+            if not client:
                 continue
+
             task = asyncio.create_task(
-                self._execute_single_client_async(client, cat, client_configs.get(cid, {}), target_id, custom_cmd, length)
+                self._execute_single_client_async(client, cat, conf, target_id, custom_cmd, length)
             )
             tasks.append(task)
         
@@ -1614,6 +1559,23 @@ class QuickTimeEventTab(QtWidgets.QWidget):
         logger.info("Quick Time Event batch completed.")
     
     async def _execute_single_client_async(self, client, cat, conf, target_id, custom_cmd, length):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            provision._get_executor(), 
+            partial(self._execute_single_client_sync_wrapper, client, cat, conf, target_id, custom_cmd, length)
+        )
+
+    def _execute_single_client_sync_wrapper(self, client, cat, conf, target_id, custom_cmd, length):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+             loop.run_until_complete(
+                 self._execute_single_client_implementation(client, cat, conf, target_id, custom_cmd, length)
+             )
+        finally:
+             loop.close()
+
+    async def _execute_single_client_implementation(self, client, cat, conf, target_id, custom_cmd, length):
         cid = client.get('id') or client.get('star')
         creds = client.get('credentials', {})
         hostname = creds.get('hostname')
@@ -1833,12 +1795,12 @@ class QuickTimeEventTab(QtWidgets.QWidget):
         except Exception as e:
             logger.error(f"[{cid}] Quick Time Event error: {e}")
     
-    def _run_batch_logic_sync(self, target_clients, client_configs):
+    def _run_batch_logic_sync(self, cat, target_clients, client_configs, target_id, custom_cmd, length):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(
-                self._run_batch_logic_async(target_clients, client_configs)
+                self._run_batch_logic_async(cat, target_clients, client_configs, target_id, custom_cmd, length)
             )
         finally:
             loop.close()
@@ -2073,58 +2035,12 @@ class HomeTab(QtWidgets.QWidget):
         header.addLayout(title_section)
         header.addStretch()
         btn_layout = QtWidgets.QHBoxLayout()
-        self.add_refresh_btn = QtWidgets.QPushButton("📶︎ Enumerate the Loathed Clients")
-        self.add_refresh_btn.setFixedHeight(32)
-        self.add_refresh_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1c395c;
-                border: 1px solid #87CEEB;
-                color: #e0e0e0;
-                border-radius: 4px;
-                font-size: 12px;
-            }
-            QPushButton:hover { background-color: #143048; }
-        """)
-        self.add_refresh_btn.clicked.connect(self._trigger_ping)
-        btn_layout.addWidget(self.add_refresh_btn)
         add_btn = QtWidgets.QPushButton("+ Add Client")
         add_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        add_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1c395c;
-                border: 1px solid #87CEEB;
-                color: #e0e0e0;
-                border-radius: 4px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #143048;
-            }
-            QPushButton:pressed {
-                background-color: #0a1824;
-            }
-        """)
-        
         add_btn.clicked.connect(self._open_add_client_dialog)
         header.addWidget(add_btn)
-        refresh_btn = QtWidgets.QPushButton("🔄 Refresh")
+        refresh_btn = QtWidgets.QPushButton("⟳ Refresh")
         refresh_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        refresh_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1c395c;
-                border: 1px solid #87CEEB;
-                color: #e0e0e0;
-                border-radius: 4px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #143048;
-            }
-            QPushButton:pressed {
-                background-color: #0a1824;
-            }
-        """)
-        
         refresh_btn.clicked.connect(self._trigger_ping)
         header.addWidget(refresh_btn)
         layout.addLayout(header)
@@ -2391,21 +2307,6 @@ class SchedulerTab(QtWidgets.QWidget):
         controls_layout.addStretch()
         self.edit_events_btn = QtWidgets.QPushButton("+ Add/Edit Event")
         self.edit_events_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.edit_events_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1c395c;
-                border: 1px solid #87CEEB;
-                color: #e0e0e0;
-                border-radius: 4px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #143048;
-            }
-            QPushButton:pressed {
-                background-color: #0a1824;
-            }
-        """)
         self.edit_events_btn.clicked.connect(self.open_edit_events_dialog)
         controls_layout.addWidget(self.edit_events_btn)
         layout.addLayout(controls_layout)
@@ -3056,23 +2957,6 @@ class user_interface:
         add_btn = QtWidgets.QPushButton("  Add New Client")
         add_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         add_btn.setText("+ New Client")
-        add_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2563EB;
-                color: white;
-                border: none;
-                padding: 10px 20px;
-                border-radius: 6px;
-                font-weight: 600;
-                font-size: 13px;
-            }
-            QPushButton:hover {
-                background-color: #1D4ED8;
-            }
-            QPushButton:pressed {
-                background-color: #1E40AF;
-            }
-        """)
         add_btn.clicked.connect(self.add_client_dialog)
         header_layout.addWidget(title_label)
         header_layout.addStretch()
@@ -3235,31 +3119,9 @@ class user_interface:
         button_layout.addStretch()
         
         cancel_btn = QtWidgets.QPushButton("Cancel")
-        cancel_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #404040;
-                color: #ffffff;
-                border: none;
-            }
-            QPushButton:hover {
-                background-color: #505050;
-            }
-        """)
         cancel_btn.clicked.connect(dialog.reject)
         
         add_btn = QtWidgets.QPushButton("+ Add Output Client")
-        add_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1c395c;
-                border: 1px solid #87CEEB;
-                color: #e0e0e0;
-                border-radius: 4px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #14a0a6;
-            }
-        """)
         add_btn.clicked.connect(lambda: self.save_new_client(
             dialog,
             star_type_combo.currentText(),
@@ -3778,7 +3640,9 @@ class EventSchedulerEngine:
         event['client_config'] = {}
         if cc_elem is not None:
             for cf in cc_elem.findall('ClientConfig'):
-                cid = cf.get('id')
+                raw_id = cf.get('id')
+                client_ref = cf.get('client')
+                
                 config = {
                     'action': cf.find('Action').text if cf.find('Action') is not None else "LoadRun",
                     'flavor': cf.find('Flavor').text if cf.find('Flavor') is not None else "",
@@ -3789,7 +3653,14 @@ class EventSchedulerEngine:
                     'su': cf.find('SU').text if cf.find('SU') is not None else "",
                     'ldl_state': cf.find('LDLState').text if cf.find('LDLState') is not None else ""
                 }
-                event['client_config'][cid] = config
+                
+                if client_ref:
+                    config['client_id'] = client_ref
+                    config['action_guid'] = raw_id
+                    event['client_config'][raw_id] = config
+                else:
+                    config['client_id'] = raw_id
+                    event['client_config'][raw_id] = config
         flavors_elem = event_elem.find('flavor')
         event['flavor'] = {}
         if flavors_elem is not None:
@@ -3923,6 +3794,15 @@ class EventSchedulerEngine:
         }
         
     def _trigger_event_wrapper(self, event: Dict, phase: str):
+        t = threading.Thread(
+            target=self._fire_background_event,
+            args=(event, phase),
+            daemon=True,
+            name=f"evt_{event.get('DisplayName')}_{phase}"
+        )
+        t.start()
+        
+    def _fire_background_event(self, event: Dict, phase: str):
         try:
             now = datetime.now()
             target_time = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
@@ -3938,10 +3818,9 @@ class EventSchedulerEngine:
                 'trigger_run_i1': phase == 'execute',
                 'target_time': target_time
             }
-            
-            logger.info(f"Triggering event '{event.get('DisplayName')}' phase={phase} at {now.strftime('%H:%M:%S.%f')[:-3]}")
+
             if self._loop and self._loop.is_running():
-                asyncio.run_coroutine_threadsafe(
+                 asyncio.run_coroutine_threadsafe(
                     self._execute_event(event, triggers),
                     self._loop
                 )
@@ -3988,12 +3867,23 @@ class EventSchedulerEngine:
                 return
             is_manual = (triggers is None and not is_startup)
             tasks = []
-            for client in clients:
-                cid = client.get('id') or client.get('star')
-                conf = client_configs.get(cid) or client_configs.get(client.get('star'))
-                if not conf:
-                    continue
+            
+            client_map = {}
+            for c in clients:
+                c_id = c.get('id')
+                c_star = c.get('star')
+                if c_id: client_map[c_id] = c
+                if c_star and c_star not in client_map: client_map[c_star] = c
+
+            for key, conf in client_configs.items():
+                target_cid = conf.get('client_id')
+                if not target_cid:
+                    target_cid = key
                     
+                client = client_map.get(target_cid)
+                if not client:
+                    continue
+
                 tasks.append(self._dispatch_client_action(client, conf, event, triggers, is_manual))
                 
             if tasks:
@@ -4502,10 +4392,24 @@ class EventSchedulerEngine:
             cc = ET.SubElement(cc_container, 'ClientConfig')
             cc.set('id', cid)
             
-            for key, default in [('action', 'LoadRun'), ('flavor', ''), ('presentation_id', ''),
-                                  ('duration', ''), ('logo', ''), ('command', ''), 
-                                  ('su', ''), ('ldl_state', '')]:
-                elem = ET.SubElement(cc, key.replace('_', '').title().replace('Id', 'ID'))
+            client_ref = config.get('client_id')
+            if client_ref:
+                cc.set('client', client_ref)
+            
+            tag_map = {
+                'action': 'Action',
+                'flavor': 'Flavor',
+                'presentation_id': 'PresentationID',
+                'duration': 'Duration',
+                'logo': 'Logo',
+                'command': 'Command',
+                'su': 'SU',
+                'ldl_state': 'LDLState'
+            }
+
+            for key, tag in tag_map.items():
+                default = 'LoadRun' if key == 'action' else ''
+                elem = ET.SubElement(cc, tag)
                 elem.text = str(config.get(key, default))
                 
         c_container = ET.SubElement(event_elem, 'clients')
